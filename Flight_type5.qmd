@@ -1,0 +1,2408 @@
+---
+title: "csv Keskin"
+author: "Alice Rodrigues"
+format: pdf
+execute:
+  echo: true    # Affiche le code (false pour cacher)
+  warning: false  # Cache les warnings
+editor: visual
+---
+
+# Libraries
+
+```{r}
+library(here)
+library(zoo)
+library(geosphere)
+library(lubridate)
+library(sf)
+library(dplyr)
+
+library(rgl)
+library(lmerTest)
+library(ggplot2)
+library(stringi)
+
+library(suncalc)
+
+library(patchwork)
+```
+
+# Chargement des données
+
+```{r}
+#| eval: false
+#| include: false
+# Données HF Ornitela
+load(here("Alice/STE_data_preparation_June_2026/2.Data_preparation/2.1_OUTPUT_STE_France_processed_HF_A_2026-06-04.RData"))  # Point par point HF
+subset_HF.ID <- data_HF[data_HF$HF.ID == 2047, ]
+nrow(data_HF[data_HF$HF.ID == 2047, ])
+
+# Données préparées Keskin
+Aquila_nipalensis <- read.csv(here("PYTHON/adaptive_soaring_strategy/prepared_data/Aquila_nipalensis.csv"))
+
+Aquila_rapax <- read.csv(here("PYTHON/adaptive_soaring_strategy/prepared_data/Aquila_rapax.csv"))
+```
+
+# Découpage
+
+```{r}
+#| eval: false
+#| include: false
+conflicts_prefer(dplyr::filter)
+#
+ecoregions <- st_read(here( "Alice/Data_analysis_June_2026/Ecoregions2017/Ecoregions2017.shp"), wkt_filter = st_as_text( st_as_sfc(st_bbox(c( xmin = -20, xmax = 60, ymin = 0, ymax = 40 ), crs = 4326)) ) ) 
+names(ecoregions) 
+#unique(ecoregions$BIOME_NAME)
+#unique(ecoregions$ECO_NAME)
+
+desert <- ecoregions[ecoregions$BIOME_NAME == "Deserts & Xeric Shrublands", ] 
+plot(desert["BIOME_NAME"])
+
+sahara <- ecoregions[grepl("Sahara", ecoregions$ECO_NAME), ] 
+plot(sahara["BIOME_NAME"])
+
+tibesti_sahara <- ecoregions[grepl("Sahara|Tibesti-Jebel Uweinat", ecoregions$ECO_NAME), ] 
+plot(tibesti_sahara["BIOME_NAME"])
+
+
+# sf de data_HF
+data_HF <- data_HF[complete.cases(data_HF[,c("location.long","location.lat")]),]
+pts_sf <- st_as_sf(data_HF, coords = c("location.long", "location.lat"), crs = 4326)
+
+coords <- st_coordinates(pts_sf)
+# coords[,1] = longitude, coords[,2] = latitude
+lat <- coords[,2]
+intersects_vec <- apply(st_intersects(pts_sf, tibesti_sahara, sparse = FALSE), 1, any)
+
+pts_sf$Zone_interet <- ifelse(
+  (lat >= 17.51 & lat <= 26.0) | intersects_vec,
+  "Zone_interet",
+  NA
+)
+unique(pts_sf$Zone_interet)
+# Check
+tab <- table(pts_sf$Zone_interet, useNA = "ifany")
+# proportion
+prop <- tab / sum(tab) * 100
+prop # 17% de zone interet
+# Add Zone_interet to data
+data_HF$Zone_interet <- pts_sf$Zone_interet
+
+# Découpage
+data_HF <- data_HF %>%
+  filter(!is.na(Zone_interet))
+
+```
+
+# Colonnes utiles
+
+```{r}
+#| eval: false
+#| include: false
+# Saisons
+data_HF$date <- as.Date(data_HF$timestamp)
+data_HF <- data_HF %>%
+  mutate(
+    MIGRATION = case_when(
+      month(date) %in% 1:7  ~ "spring",
+      month(date) %in% 8:12 ~ "autumn",
+      TRUE ~ NA_character_
+    )
+  )
+str(data_HF)
+# Groupes d'age
+data_HF <- data_HF %>%
+  mutate(
+    age_group = case_when(
+      age_CY == "adult" ~ "adult",
+      !is.na(age_CY) & age_CY != "adult" ~ "juvenile",
+      TRUE ~ NA_character_
+    )
+  )
+data_HF$age_group <- as.factor(data_HF$age_group)
+table(data_HF$age_group, useNA = "ifany")
+```
+
+# Visualisation data_HF
+
+```{r}
+#| eval: false
+#| include: false
+###
+unique(data_HF$bird_year)
+data_filtre <- data_HF %>%
+  filter(bird_year == "STE_FR_La Diva de Buoux_2024")
+data_filtre <- data_filtre %>%
+  filter(MIGRATION == "spring")
+str(data_HF)
+
+data_filtre <- data_filtre %>%
+  filter(timestamp >= as.POSIXct("2024-03-01 13:00:00") &
+         timestamp <= as.POSIXct("2024-03-01 15:30:00"))
+
+ggplot(data_filtre, aes(x = location.long, y = location.lat)) +
+  geom_point(color = "blue", alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "Trajectoire filtrée") # AH spring 2024 La Diva, bien seulement deux géofences (le 3ème et le 4ème, le 5e etant au Maroc)
+
+
+```
+
+# Conversions data_HF -\> Circaetus_gallicus
+
+Attention, tout faire par HF.ID et prendre en compte les différents individus.
+
+## Nouveau tableau
+
+```{r}
+#| eval: false
+#| include: false
+# Fenêtre de lissage pour MA
+ma_window <- 5
+
+# Point de référence pour transformer lat/lon en X,Y
+ref_lon <- min(data_HF$location.long)
+ref_lat <- min(data_HF$location.lat)
+
+# Nouveau tableau
+data_HF$HF.ID <- as.factor(data_HF$HF.ID)
+Circaetus_gallicus <- data.frame(
+  HF.ID = data_HF$HF.ID,
+  timestamp = data_HF$timestamp,
+  X.m = distGeo(cbind(ref_lon, ref_lat), cbind(data_HF$location.long, ref_lat)),
+  Y.m = distGeo(cbind(ref_lon, ref_lat), cbind(ref_lon, data_HF$location.lat)),
+  Z.m = data_HF$height.above.ground_GPS,
+  ele = data_HF$height.above.ground_GPS,
+  lon = data_HF$location.long,
+  lat = data_HF$location.lat,
+  Species = "Circaetus gallicus",
+  individuals = data_HF$individual.local.identifier,
+  dtime = data_HF$dtime_new,
+  age_group = data_HF$age_group,
+  season = data_HF$MIGRATION
+)
+#summary(data_HF$height.above.ellipsoid_GPS)
+#summary(data_HF$height.above.ground_GPS)
+#summary(data_HF$height.above.msl_GPS)
+
+# Date_in_unix et only_date
+# "origin at the beginning of data belonging to each bird and day"
+#### Probmème ici
+# Nous il faut que ce soit à partir du début de chaque HF.ID pour chaque individuals.
+# Il faut que ce soit : 0.3, 0.6, 0.9, 1.2, 1.5.... (en minute)
+Circaetus_gallicus$only_date <- as.Date(Circaetus_gallicus$timestamp)
+Circaetus_gallicus <- Circaetus_gallicus %>%
+  arrange(HF.ID, timestamp) %>%
+  group_by(HF.ID, only_date) %>%
+  mutate(
+    date_in_unix = as.numeric(difftime(timestamp, min(timestamp), units = "secs"))
+  ) %>%
+  ungroup()
+summary(Circaetus_gallicus$date_in_unix)
+summary(Circaetus_gallicus$dtime)
+
+# Correction des signes
+Circaetus_gallicus$X.m <- ifelse(data_HF$location.long < ref_lon, -Circaetus_gallicus$X.m, Circaetus_gallicus$X.m)
+Circaetus_gallicus$Y.m <- ifelse(data_HF$location.lat < ref_lat, -Circaetus_gallicus$Y.m, Circaetus_gallicus$Y.m)
+```
+
+## Noyau gaussien et Lissage MA (Moving Average)
+
+```{r}
+#| eval: false
+#| include: false
+# Créer un noyau gossien
+gaussian_kernel <- function(n, sigma) {
+  x <- seq(-floor(n/2), floor(n/2), length.out = n)
+  w <- exp(-x^2 / (2 * sigma^2))
+  w / sum(w)
+}
+
+# Appliquer le filtre
+window_size <- 7 # (2loc avant 2 loc après) tester diff window : 3, 5 et 7
+sigma <- 0.8
+kernel <- gaussian_kernel(window_size, sigma)
+
+Circaetus_gallicus <- Circaetus_gallicus %>%
+  arrange(HF.ID, timestamp) %>%
+  group_by(HF.ID) %>%
+  mutate(
+    X.m._MA = if(n() >= length(kernel)) stats::filter(X.m, kernel, sides = 2) else NA,
+    Y.m._MA = if(n() >= length(kernel)) stats::filter(Y.m, kernel, sides = 2) else NA,
+    Z.m._MA = if(n() >= length(kernel)) stats::filter(Z.m, kernel, sides = 2) else NA
+  ) %>%
+  ungroup() # Applique un filtre si il n'y a pas assez de points, met NA
+
+
+
+########## Il y a un problème avec Z? => Non mais valeurs très hautes
+
+
+# Lissage
+Circaetus_gallicus$X.m._MA <- rollmean(Circaetus_gallicus$X.m, ma_window, fill = NA, align = "center")
+Circaetus_gallicus$Y.m._MA <- rollmean(Circaetus_gallicus$Y.m, ma_window, fill = NA, align = "center")
+Circaetus_gallicus$Z.m._MA <- rollmean(Circaetus_gallicus$Z.m, ma_window, fill = NA, align = "center")
+```
+
+## Calcul des vitesses et accélérations filtrées
+
+```{r}
+#| eval: false
+#| include: false
+conflicts_prefer(dplyr::lag)
+Circaetus_gallicus <- Circaetus_gallicus %>%
+  arrange(HF.ID, timestamp) %>%
+  group_by(HF.ID, only_date) %>%
+  mutate(
+    dtime_sec = dtime * 60,
+
+    # MA positions
+    X.m._MA = rollmean(X.m, 5, fill = NA, align = "center"),
+    Y.m._MA = rollmean(Y.m, 5, fill = NA, align = "center"),
+    Z.m._MA = rollmean(Z.m, 5, fill = NA, align = "center"),
+
+    # Vitesses (lag au lieu de diff)
+    Vx = (X.m._MA - lag(X.m._MA)) / dtime_sec,
+    Vy = (Y.m._MA - lag(Y.m._MA)) / dtime_sec,
+    Vz = (Z.m._MA - lag(Z.m._MA)) / dtime_sec,
+    Vxy = sqrt(Vx^2 + Vy^2),
+
+    # MA vitesses
+    Vx_MA = rollmean(Vx, 5, fill = NA, align = "center"),
+    Vy_MA = rollmean(Vy, 5, fill = NA, align = "center"),
+    Vz_MA = rollmean(Vz, 5, fill = NA, align = "center"),
+    Vxy_MA = sqrt(Vx_MA^2 + Vy_MA^2),
+
+    # Accélérations
+    Ax = (Vx_MA - lag(Vx_MA)) / dtime_sec,
+    Ay = (Vy_MA - lag(Vy_MA)) / dtime_sec,
+
+    # MA accélérations
+    Ax_MA = rollmean(Ax, 5, fill = NA, align = "center"),
+    Ay_MA = rollmean(Ay, 5, fill = NA, align = "center"),
+
+    
+    
+    # K = (Vx * Ay - Vy * Ax) / (Vx^2 + Vy^2)^(3/2) 
+    # Courbure du mouvement (virage)
+    # gliding: |k| < 0.01 m-1 and vz < 0 m/s, thermalling: |k| > 0.01 m-1 and vz > 0 m/s
+    K = (Vx * Ay - Vy * Ax) / (Vx^2 + Vy^2)^(3/2),
+    K_MA = rollmean(K, 5, fill = NA, align = "center"),
+     ) %>%
+  ungroup()
+
+
+### Ajout colonnes
+Circaetus_gallicus$vertical_speed  <- Circaetus_gallicus$Vz_MA
+Circaetus_gallicus$horizontal_speed <- Circaetus_gallicus$Vxy_MA
+```
+
+## Check
+
+```{r}
+#| eval: false
+#| include: false
+#str(Circaetus_gallicus)
+summary(Circaetus_gallicus$Vx)
+summary(Circaetus_gallicus$Vy)
+summary(Circaetus_gallicus$Vxy)
+
+summary(Circaetus_gallicus$Ax_MA)
+summary(Circaetus_gallicus$Ay_MA)
+
+summary(Circaetus_gallicus$K)
+
+# Aquila
+summary(Aquila_nipalensis$Vx)
+summary(Aquila_nipalensis$Vy)
+summary(Aquila_nipalensis$Vxy)
+
+summary(Aquila_nipalensis$Ax_MA)
+summary(Aquila_nipalensis$Ay_MA)
+
+summary(Aquila_nipalensis$K)
+
+#################
+summary(Aquila_nipalensis$vertical_speed)
+summary(Circaetus_gallicus$vertical_speed)
+summary(Circaetus_gallicus$Vz_MA)
+summary(Circaetus_gallicus$Vz)
+```
+
+# Ecriture csv python
+
+```{r}
+#| eval: false
+#| include: false
+# Suppréssion des colonnes en trop
+
+#Circaetus_gallicus <- Circaetus_gallicus %>%
+#  select(-HF.ID, -timestamp, -X.m, -Y.m, -Z.m, -dtime, -dtime_sec)
+
+# COMPARAISON
+setdiff(colnames(Circaetus_gallicus), colnames(Aquila_nipalensis)) #ok
+
+# ECRITURE CSV python
+#write.table(Circaetus_gallicus,
+#            file = paste(here("PYTHON/adaptive_soaring_strategy/prepared_data/Circaetus_gallicus"), Sys.Date(), ".csv", sep = ""),
+#            row.names = F, sep = ",")
+
+#### Jeu de donnée Thermique Robin
+
+start_date <- as.POSIXct("2025-10-09 23:00", tz = "UTC")
+end_date   <- as.POSIXct("2025-10-15 23:00", tz = "UTC") # C'est clair on voit qu'il n'y a pas de données pour certaines zones
+                                                         # Et non c'ets simplement que la fenêtre graphique affiche seulement la partie HF qui se trouve dans l'intervalle demandé, sans montrer un "vide" pour le reste. Donc ici on a que la partie HF du dernier géofence avant le Maroc.
+
+# Filtrer les dates pour l'individu "Robin Nohood"
+C_g_Robin_Nohood <- Circaetus_gallicus[
+  Circaetus_gallicus$individuals == "Robin Nohood" &
+  Circaetus_gallicus$timestamp >= start_date &
+  Circaetus_gallicus$timestamp <= end_date,
+]
+C_g_Robin_Nohood <- C_g_Robin_Nohood[order(C_g_Robin_Nohood$timestamp),]
+
+# ECRITURE CSV python
+#write.table(C_g_Robin_Nohood,
+#            file = paste(here("PYTHON/adaptive_soaring_strategy/prepared_data/C_g_Robin_Nohood"), Sys.Date(), ".csv", sep = ""),
+#            row.names = F, sep = ",")
+
+
+
+##################### Ad / Juv ###############################
+unique(Circaetus_gallicus$age_group)
+Circaetus_gallicus_juv <- Circaetus_gallicus %>%
+  filter(age_group == "juvenile")
+Circaetus_gallicus_ad <- Circaetus_gallicus %>%
+  filter(age_group == "adult")
+
+Circaetus_gallicus_ad_s <- Circaetus_gallicus_ad %>%
+  filter(season == "spring")
+Circaetus_gallicus_ad_a <- Circaetus_gallicus_ad %>%
+  filter(age_group == "adult")
+
+Circaetus_gallicus_juv_s <- Circaetus_gallicus_juv %>%
+  filter(season == "spring")
+Circaetus_gallicus_juv_a <- Circaetus_gallicus_juv %>%
+  filter(season == "autumn")
+
+################# Write tables #############################
+
+# all
+write.table(Circaetus_gallicus,
+            file = paste(here("PYTHON/adaptive_soaring_strategy/prepared_data/Circaetus_gallicus"), Sys.Date(), ".csv", sep = ""),
+            row.names = F, sep = ",")
+# Juv
+write.table(Circaetus_gallicus_juv,
+            file = paste(here("PYTHON/adaptive_soaring_strategy/prepared_data/Circaetus_gallicus_juv"), Sys.Date(), ".csv", sep = ""),
+            row.names = F, sep = ",")
+# Ad
+write.table(Circaetus_gallicus_ad,
+            file = paste(here("PYTHON/adaptive_soaring_strategy/prepared_data/Circaetus_gallicus_ad"), Sys.Date(), ".csv", sep = ""),
+            row.names = F, sep = ",")
+
+# Juv_s
+#write.table(Circaetus_gallicus_juv_s,
+#            file = paste(here("PYTHON/adaptive_soaring_strategy/prepared_data/Circaetus_gallicus_juv_s"), Sys.Date(), ".csv", sep = ""),
+#            row.names = F, sep = ",")
+# Ad_s
+#write.table(Circaetus_gallicus_ad_s,
+#            file = paste(here("PYTHON/adaptive_soaring_strategy/prepared_data/Circaetus_gallicus_ad_s"), Sys.Date(), ".csv", sep = ""),
+#            row.names = F, sep = ",")
+
+# Juv_a
+#write.table(Circaetus_gallicus_juv_a,
+#            file = paste(here("PYTHON/adaptive_soaring_strategy/prepared_data/Circaetus_gallicus_juv_a"), Sys.Date(), ".csv", sep = ""),
+#            row.names = F, sep = ",")
+# Ad_a
+#write.table(Circaetus_gallicus_ad_a,
+#            file = paste(here("PYTHON/adaptive_soaring_strategy/prepared_data/Circaetus_gallicus_ad"), Sys.Date(), ".csv", sep = ""),
+#            row.names = F, sep = ",")
+
+```
+
+## Ajout du comp et drift_ratio (création du csv python)
+
+```{r}
+#| eval: false
+#| include: false
+data_drift <- read.csv(here("Alice/Data_analysis_June_2026/Analyses/hourly_segments.csv"))
+#Circaetus_gallicus <- read.csv(here("PYTHON/adaptive_soaring_strategy/prepared_data/Circaetus_gallicus.csv"))
+str(data_drift)
+
+# Préparer la clé de jointure depuis data_drift
+comp_by_indiv_date <- data_drift %>%
+  mutate(
+    Individual = stri_trans_general(
+      gsub("_spring_\\d{4}|_autumn_\\d{4}", "", track_ID),
+      "Latin-ASCII"
+    ),
+    Individual = tolower(trimws(Individual)),
+    Date = as.character(as.Date(hour))
+  ) %>%
+  group_by(Individual, Date) %>%
+  summarise(comp = names(which.max(table(comp))), .groups = "drop")
+
+# Joindre à Circaetus_gallicus
+Circaetus_gallicus <- Circaetus_gallicus %>%
+  mutate(
+    Individual_key = tolower(trimws(stri_trans_general(individuals, "Latin-ASCII"))),
+    Date = as.character(only_date)
+  ) %>%
+  left_join(comp_by_indiv_date, by = c("Individual_key" = "Individual", "Date"))
+str(Circaetus_gallicus)
+
+# Vérifier les NA
+cat("Lignes sans comp:", sum(is.na(Circaetus_gallicus$comp)), "\n")
+cat("Lignes avec comp:", sum(!is.na(Circaetus_gallicus$comp)), "\n")
+
+# Séparer et exporter
+#Circaetus_gallicus_CO <- Circaetus_gallicus %>% filter(comp == "CO")
+#Circaetus_gallicus_DO <- Circaetus_gallicus %>% filter(comp == "DO")
+
+#write.csv(Circaetus_gallicus_CO, 
+#          here("PYTHON/adaptive_soaring_strategy/prepared_data/Circaetus_gallicus_CO.csv"), 
+#          row.names = FALSE)
+#write.csv(Circaetus_gallicus_DO, 
+#          here("PYTHON/adaptive_soaring_strategy/prepared_data/Circaetus_gallicus_DO.csv"), 
+#          row.names = FALSE)
+str(Circaetus_gallicus)
+table(Circaetus_gallicus$comp)
+
+
+
+
+
+
+# Drift ratio
+# drift_ratio
+# dr_log
+
+# Préparer la clé de jointure depuis data_drift
+comp_by_indiv_date <- data_drift %>%
+  mutate(
+    Individual = stri_trans_general(
+      gsub("_spring_\\d{4}|_autumn_\\d{4}", "", track_ID),
+      "Latin-ASCII"
+    ),
+    Individual = tolower(trimws(Individual)),
+    Date = as.character(as.Date(hour))
+  ) %>%
+  group_by(Individual, Date) %>%
+  summarise(drift_ratio = names(which.max(table(drift_ratio))), .groups = "drop")
+
+# Joindre à Circaetus_gallicus
+Circaetus_gallicus <- Circaetus_gallicus %>%
+  mutate(
+    Individual_key = tolower(trimws(stri_trans_general(individuals, "Latin-ASCII"))),
+    Date = as.character(only_date)
+  ) %>%
+  left_join(comp_by_indiv_date, by = c("Individual_key" = "Individual", "Date"))
+str(Circaetus_gallicus)
+
+# Vérifier les NA
+cat("Lignes sans dr:", sum(is.na(Circaetus_gallicus$drift_ratio)), "\n")
+cat("Lignes avec dr:", sum(!is.na(Circaetus_gallicus$drift_ratio)), "\n")
+table(Circaetus_gallicus$comp)
+
+# Séparer et exporter
+#Circaetus_gallicus_CO <- Circaetus_gallicus %>% filter(comp == "CO")
+#Circaetus_gallicus_DO <- Circaetus_gallicus %>% filter(comp == "DO")
+
+#write.csv(Circaetus_gallicus_CO, 
+#          here("PYTHON/adaptive_soaring_strategy/prepared_data/Circaetus_gallicus_CO.csv"), 
+#          row.names = FALSE)
+#write.csv(Circaetus_gallicus_DO, 
+#          here("PYTHON/adaptive_soaring_strategy/prepared_data/Circaetus_gallicus_DO.csv"), 
+#          row.names = FALSE)
+str(Circaetus_gallicus)
+table(Circaetus_gallicus$drift_ratio)
+```
+
+# START script analyse
+
+```{r}
+Circaetus_gallicus <- read.csv(here("PYTHON/adaptive_soaring_strategy/prepared_data/Circaetus_gallicus2026-06-05.csv"))
+```
+
+# Visuels et calculs indépendants
+
+```{r}
+##### Colonnes catégorielle vol en fonction de K
+Circaetus_gallicus1 <- Circaetus_gallicus %>%
+  mutate(
+    flight_phase = case_when(
+      abs(K) < 0.001 & Vz < 0 ~ "gliding", ## Seuils Keskin modifiés (/10)
+      abs(K) > 0.001 & Vz > 0 ~ "thermalling",
+      TRUE ~ "other"  # flapping, landing, etc.
+    )
+  )
+
+# Quelle proportion de chaque catégories
+# Comptage simple
+table(Circaetus_gallicus1$flight_phase)
+#    gliding       other thermalling 
+#     158037      249165      169184
+
+# Avec pourcentages
+table(Circaetus_gallicus1$flight_phase, useNA = "ifany") %>% 
+  prop.table() %>% 
+  round(3) * 100
+
+# Tableau détaillé par oiseau
+Circaetus_gallicus1 %>%
+  count(flight_phase, sort = TRUE) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+str(Circaetus_gallicus1)
+
+
+
+```
+
+### Comparaison Aquila nipalensis et Aquila rapax
+
+```{r}
+#| eval: false
+#| include: false
+# Pour Aquila
+
+# Créer la colonne flight_phase
+Aquila_nipalensis <- Aquila_nipalensis %>%
+  mutate(
+    flight_phase = case_when(
+      abs(K) < 0.01 & Vz < 0 ~ "gliding", ## On garde ici les seuils Keskin
+      abs(K) > 0.01 & Vz > 0 ~ "thermalling",
+      TRUE ~ "other"
+    )
+  )
+
+# Vérifier les catégories uniques
+unique(Aquila_nipalensis$flight_phase)
+
+
+# Vérifications
+
+# 1. Vérifier les seuils K et Vz sont cohérents entre espèces
+summary(Circaetus_gallicus1$K); summary(Aquila_nipalensis$K)
+summary(Circaetus_gallicus1$Vz); summary(Aquila_nipalensis$Vz)
+
+# 2. Distribution |K| pour voir si les courbures diffèrent
+# Histogramme |K| pour Circaetus
+hist(abs(Circaetus_gallicus1$K), breaks = 50, main = "Circaetus |K|", xlab = "|K| (m⁻¹)")
+
+# Histogramme |K| pour Aquila  
+hist(abs(Aquila_nipalensis$K), breaks = 50, main = "Aquila |K|", xlab = "|K| (m⁻¹)")
+
+# Statistiques descriptives
+summary(abs(Circaetus_gallicus1$K)) # Quand même beaucoup plus bruité
+summary(abs(Aquila_nipalensis$K))
+
+
+
+
+# Write
+#write.table(Circaetus_gallicus1,
+#            file = paste(here("R_Keskin/Circaetus_gallicus1"), Sys.Date(), ".csv", sep = ""),
+#            row.names = F, sep = ",")
+
+
+# Aquila_rapax
+
+# Créer la colonne flight_phase
+Aquila_rapax <- Aquila_rapax %>%
+  mutate(
+    flight_phase = case_when(
+      abs(K) < 0.01 & Vz < 0 ~ "gliding",  ## On garde ici les seuils Keskin
+      abs(K) > 0.01 & Vz > 0 ~ "thermalling",
+      TRUE ~ "other"
+    )
+  )
+
+# Vérifier les catégories uniques
+unique(Aquila_rapax$flight_phase)
+
+# Comptage simple
+table(Aquila_rapax$flight_phase)
+
+# Avec pourcentages
+table(Aquila_rapax$flight_phase, useNA = "ifany") %>% 
+  prop.table() %>% 
+  round(3) * 100 # 35% de thermalling
+
+# Tableau détaillé
+Aquila_rapax %>%
+  count(flight_phase, sort = TRUE) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+```
+
+## Visualisation Circaetus
+
+```{r}
+# Ratio : X/Y ~25000m, Z ~775m → Z est ~32x plus petit
+# aspect3d compresse visuellement Z pour qu'il paraisse réaliste
+rgl::aspect3d(1, 1, 0.03)  # z = 775/25000 ≈ 0.03
+```
+
+# Afiner :
+
+## Méthode seuil temporel
+
+```{r}
+
+Circaetus_gallicus3 <- Circaetus_gallicus1 %>%
+  arrange(HF.ID, timestamp) %>%
+  group_by(HF.ID) %>%
+  mutate(
+    is_therm = flight_phase == "thermalling",
+    
+    # propagation vers l'avant et l'arrière (fenêtre de 5 points)
+    therm_forward = zoo::rollapply(is_therm, 5, max, fill = NA, align = "left"),
+    therm_backward = zoo::rollapply(is_therm, 5, max, fill = NA, align = "right"),
+    
+    therm_propag = ifelse(therm_forward == 1 | therm_backward == 1, TRUE, FALSE),
+    
+    flight_phase_smooth = ifelse(therm_propag, "thermalling", flight_phase)
+  ) %>%
+  ungroup()
+```
+
+# Visualisation après afiner
+
+## Robin Nohood
+
+```{r}
+#### Seulement une ZONE TEST THERMIQUE (Autumn 2025)
+# Définir l'intervalle de dates
+
+start_date <- as.POSIXct("2025-10-15 16:00")
+end_date   <- as.POSIXct("2025-10-15 16:30")
+
+# Filtrer les dates pour l'individu "Robin Nohood"
+segment_to_plot <- Circaetus_gallicus3[
+  Circaetus_gallicus1$individuals == "Robin Nohood" &
+  Circaetus_gallicus1$timestamp >= start_date &
+  Circaetus_gallicus1$timestamp <= end_date,
+]
+segment_to_plot <- segment_to_plot[order(segment_to_plot$timestamp),]
+
+# 3 couleurs (= 3 comportements à afficher) :
+segment_to_plot$color <- ifelse(segment_to_plot$flight_phase_smooth == "thermalling", "red",
+                         ifelse(segment_to_plot$flight_phase_smooth == "gliding", "blue",
+                                "grey"))
+
+rgl::plot3d(x = segment_to_plot$X.m, y = segment_to_plot$Y.m, z = segment_to_plot$Z.m,
+            col = c(segment_to_plot$color) , ylab = "Y(m)", xlab= "X(m)" , zlab = "Z(m)")
+
+
+# Forcer une vraie fenêtre OpenGL (pas le device null)
+options(rgl.useNULL = FALSE)
+
+# Ouvrir explicitement une fenêtre avec une taille fixe AVANT de tracer
+rgl::open3d(windowRect = c(0, 0, 1000, 1000))
+
+rgl::plot3d(x = segment_to_plot$X.m, y = segment_to_plot$Y.m, z = segment_to_plot$Z.m,
+            col = c(segment_to_plot$color), ylab = "Y(m)", xlab = "X(m)", zlab = "Z(m)")
+
+# Laisser le temps au rendu de se terminer avant la capture
+Sys.sleep(1)
+
+#rgl::rgl.snapshot(
+#  filename = "C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/thermal_test_zone_autumn2025.png",
+#  fmt = "png"
+#)
+```
+
+```{r}
+#### Seulement une ZONE TEST THERMIQUE (Autumn 2025)
+start_date <- as.POSIXct("2025-10-15 16:00")
+end_date   <- as.POSIXct("2025-10-15 16:30")
+
+segment_to_plot <- Circaetus_gallicus3[
+  Circaetus_gallicus1$individuals == "Robin Nohood" &
+  Circaetus_gallicus1$timestamp >= start_date &
+  Circaetus_gallicus1$timestamp <= end_date,
+]
+segment_to_plot <- segment_to_plot[order(segment_to_plot$timestamp),]
+
+segment_to_plot$color <- ifelse(segment_to_plot$flight_phase_smooth == "thermalling", "red",
+                         ifelse(segment_to_plot$flight_phase_smooth == "gliding", "blue",
+                                "grey"))
+
+# Forcer une vraie fenêtre OpenGL avec taille fixe
+options(rgl.useNULL = FALSE)
+rgl::open3d(windowRect = c(0, 0, 1000, 1000))
+
+rgl::plot3d(x = segment_to_plot$X.m, y = segment_to_plot$Y.m, z = segment_to_plot$Z.m,
+            col = c(segment_to_plot$color), ylab = "Y(m)", xlab = "X(m)", zlab = "Z(m)")
+
+# Légende
+rgl::legend3d(
+  "topright",
+  legend = c("Thermalling", "Gliding", "Other"),
+  pch = 16,
+  col = c("red", "blue", "grey"),
+  cex = 2.3,
+  inset = c(0.02)
+)
+
+Sys.sleep(1)
+
+rgl::rgl.snapshot(
+  filename = "C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/thermal_test_zone_autumn2025.png",
+  fmt = "png"
+)
+```
+
+# Visualisation comp vent et comp th/gl
+
+```{r}
+#| eval: false
+#| include: false
+start_date <- as.POSIXct("2025-03-02 12:19") # La Diva 0 thermiques (2047)
+end_date   <- as.POSIXct("2025-03-02 14:15")
+
+# Filtrer les dates pour l'individu "La Diva de Buoux"
+segment_to_plot <- Circaetus_gallicus3[
+  Circaetus_gallicus1$individuals == "La Diva de Buoux" &
+  Circaetus_gallicus1$timestamp >= start_date &
+  Circaetus_gallicus1$timestamp <= end_date,
+]
+segment_to_plot <- segment_to_plot[order(segment_to_plot$timestamp),]
+
+# 3 couleurs (= 3 comportements à afficher) :
+segment_to_plot$color <- ifelse(segment_to_plot$flight_phase_smooth == "thermalling", "red",
+                         ifelse(segment_to_plot$flight_phase_smooth == "gliding", "blue",
+                                "grey"))
+
+rgl::plot3d(x = segment_to_plot$X.m, y = segment_to_plot$Y.m, z = segment_to_plot$Z.m,
+            col = c(segment_to_plot$color) , ylab = "Y(m)", xlab= "X(m)" , zlab = "Z(m)")
+
+
+
+### Couleur par comp
+unique (Circaetus_gallicus3$comp)
+table (Circaetus_gallicus3$comp)
+
+
+# Palette de couleurs pour chaque comp
+comp_colors <- c(
+  "CF"  = "orange",  # Full compensation — orange
+  "CP"  = "yellow",  # Partial compensation — yellow
+  "DF"  = "skyblue3",  # Full drift — jaune
+  "DO"  = "blue1",  # Over drift — orange
+  "CO"  = "red",  # Over compensation
+  "NSW" = "#bababa",  # No sidewind — gris
+  "0"   = "#ffffff"   # Non classifié — blanc
+)
+
+# Filtrer
+segment_to_plot <- Circaetus_gallicus3[
+  Circaetus_gallicus3$individuals == "La Diva de Buoux" &
+  Circaetus_gallicus3$timestamp >= start_date &
+  Circaetus_gallicus3$timestamp <= end_date,
+]
+segment_to_plot <- segment_to_plot[order(segment_to_plot$timestamp), ]
+
+# Assigner la couleur selon comp
+segment_to_plot$color <- comp_colors[as.character(segment_to_plot$comp)]
+segment_to_plot$color[is.na(segment_to_plot$color)] <- "grey60"  # NA -> gris
+
+# Plot 3D
+rgl::plot3d(
+  x = segment_to_plot$X.m,
+  y = segment_to_plot$Y.m,
+  z = segment_to_plot$Z.m,
+  col  = segment_to_plot$color,
+  xlab = "X(m)", ylab = "Y(m)", zlab = "Z(m)"
+)
+
+# Légende
+rgl::legend3d(
+  "topright",
+  legend = names(comp_colors),
+  col    = comp_colors,
+  pch    = 16,
+  cex    = 0.8
+)
+
+str(Circaetus_gallicus3)
+```
+
+# Métriques thermiques
+
+## Séléction seulement des périodes en journée
+
+```{r}
+library(conflicted)
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+
+# Ajout colonne sunrise & mins_since_sunrise
+str(Circaetus_gallicus3)
+Circaetus_gallicus3 <- Circaetus_gallicus3 %>%
+  mutate(
+    timestamp_posix  = as.POSIXct(timestamp, tz = "UTC"),
+    only_date_parsed = as.Date(only_date)
+  )
+
+# Combinaisons uniques date × lat × lon
+sun_keys <- Circaetus_gallicus3 %>%
+  select(only_date_parsed, lat, lon) %>%
+  distinct()
+
+# Calcul des levers de soleil
+sun_times <- getSunlightTimes(
+  data = data.frame(
+    date = sun_keys$only_date_parsed,
+    lat  = sun_keys$lat,
+    lon  = sun_keys$lon
+  ),
+  keep = "sunrise",
+  tz   = "UTC"
+)
+
+# Ajout du sunrise aux clés
+sun_keys <- sun_keys %>%
+  bind_cols(sunrise = sun_times$sunrise)
+
+# Join et calcul du temps écoulé
+Circaetus_gallicus3 <- Circaetus_gallicus3 %>%
+  left_join(sun_keys, by = c("only_date_parsed", "lat", "lon")) %>%
+  mutate(
+    secs_since_sunrise = as.numeric(difftime(timestamp_posix, sunrise, units = "secs")),
+    mins_since_sunrise = secs_since_sunrise / 60
+  )
+
+Circaetus_gallicus3$flight_phase_smooth <- as.factor(Circaetus_gallicus3$flight_phase_smooth)
+
+
+# Garder seulement les lignes au moins 1h après le lever du soleil
+# Identifier les HF.ID dont TOUT le track est après 1h du lever
+tracks_apres_1h <- Circaetus_gallicus3 %>%
+  group_by(HF.ID) %>%
+  summarise(
+    mins_debut = first(mins_since_sunrise)
+  ) %>%
+  filter(mins_debut >= 60) %>%
+  pull(HF.ID)
+
+# Garder ces tracks complets dans Circaetus_gallicus3_jour
+Circaetus_gallicus3_jour <- Circaetus_gallicus3 %>%
+  filter(HF.ID %in% tracks_apres_1h)
+```
+
+## Exclusion des tracks anomalies de comportement
+
+Exemples :
+
+Mina de Rians : 2023-10-01 14:28:23 -\> 2023-10-01 15:33:23
+
+Mina de Rians : 2024-08-30 11:36:12 -\> 2024-08-30 12:31:45
+
+Aupsie : 2025-03-09 17:01:09 -\> 2025-03-09 18:03:15
+
+Aupsie : 2025-09-24 13:14:10 -\> 2025-09-24 14:12:55
+
+```{r}
+# Sinuosité = distance totale / déplacement net
+# Une valeur proche de 1 = vol directionnel (migration)
+# Une valeur élevée = vol tortueux (forage, exploration)
+
+sinuosite <- Circaetus_gallicus3_jour %>%
+  group_by(HF.ID) %>%
+  summarise(
+    ID              = first(individuals),
+    timestamp_debut = first(timestamp),
+    timestamp_fin   = last(timestamp),
+    duree_mins      = as.numeric(difftime(last(timestamp), first(timestamp), units = "mins")),
+    dist_totale     = sum(sqrt(diff(X.m)^2 + diff(Y.m)^2), na.rm = TRUE),
+    dist_nette      = sqrt((last(X.m) - first(X.m))^2 + (last(Y.m) - first(Y.m))^2),
+    .groups = "drop"
+  ) %>%
+  filter(duree_mins >= 30) %>%
+  mutate(
+    sinuosite = dist_totale / dist_nette
+  ) %>%
+  arrange(desc(sinuosite))
+
+sinuosite
+summary(sinuosite$sinuosite)
+hist(sinuosite$sinuosite, 
+     breaks = 50,
+     main = "Distribution de la sinuosité des tracks",
+     xlab = "Sinuosité (dist totale / dist nette)")
+
+# Exculsion des tracks dont la sinuosité est > 2.3
+
+# Identifier les HF.ID à exclure
+tracks_a_exclure <- sinuosite %>%
+  filter(sinuosite > 2.3) %>%
+  pull(HF.ID)
+
+cat("Nombre de tracks exclus :", length(tracks_a_exclure), "\n")
+
+# Filtrer Circaetus_gallicus3_jour
+Circaetus_gallicus3_jour <- Circaetus_gallicus3_jour %>%
+  filter(!HF.ID %in% tracks_a_exclure)
+
+cat("Nombre de tracks restants :", n_distinct(Circaetus_gallicus3_jour$HF.ID), "\n")
+```
+
+## Tableau tracks de 1h et 2h
+
+```{r}
+# Tracks de ~ 1h
+# Tracks de ~1h parmi ces tracks post-aube
+tableau_tracks_1h_jour <- Circaetus_gallicus3_jour %>%
+  group_by(HF.ID) %>%
+  summarise(
+    ID              = first(individuals),
+    timestamp_debut = first(timestamp),
+    timestamp_fin   = last(timestamp),
+    duree_mins      = as.numeric(difftime(last(timestamp), first(timestamp), units = "mins")),
+    mins_debut      = first(mins_since_sunrise)
+  ) %>%
+  ungroup() %>%
+  filter(duree_mins >= 55 & duree_mins <= 65)
+tableau_tracks_1h_jour
+
+#write.table(tableau_tracks_1h_jour,
+#            file = paste(here("Alice/Data_analysis/Analyses/tableau_tracks_1h_jour"), ".csv", sep = ""),
+#            row.names = F, sep = ",")
+
+
+# Tracks de ~ 2h
+tableau_tracks_2h_jour <- Circaetus_gallicus3_jour %>%
+  group_by(HF.ID) %>%
+  summarise(
+    ID              = first(individuals),
+    timestamp_debut = first(timestamp),
+    timestamp_fin   = last(timestamp),
+    duree_mins      = as.numeric(difftime(last(timestamp), first(timestamp), units = "mins"))
+  ) %>%
+  ungroup() %>%
+  filter(duree_mins >= 110 & duree_mins <= 130)
+tableau_tracks_2h_jour
+
+#write.table(tableau_tracks_2h_jour,
+#            file = paste(here("Alice/Data_analysis/Analyses/tableau_tracks_2h"), ".csv", sep = ""),
+#            row.names = F, sep = ",")
+
+```
+
+## Comptage nombre thermique sur tracks individuels HF.ID
+
+```{r}
+conflict_prefer("lag", "dplyr")
+
+## Comptage des thermiques
+# 0 ou 1 thermique : HF.ID = 2047 6> 0?
+# 16 thermiques : HF.ID = 2208
+# 6 thermiques : HF.ID = 2212
+
+
+## subset_HF.ID
+subset_HF.ID <- Circaetus_gallicus3[Circaetus_gallicus3$HF.ID == 69, ]
+nrow(Circaetus_gallicus3[Circaetus_gallicus3$HF.ID == 69, ])
+
+# Étape 1 : phase_merged (absorber other isolés)
+subset_HF.ID <- subset_HF.ID %>%
+  arrange(timestamp) %>%
+  mutate(
+    phase_clean = ifelse(is.na(as.character(flight_phase_smooth)), "other",
+                         as.character(flight_phase_smooth)),
+    prev_phase = lag(phase_clean),
+    next_phase = lead(phase_clean),
+    phase_merged = case_when(
+  phase_clean == "other" & prev_phase == "thermalling" & next_phase == "thermalling" ~ "thermalling",
+  TRUE ~ as.character(phase_clean)
+)
+    )
+
+# Étape 2 : absorber aussi les blocs "gliding" COURTS entre deux thermalling
+n_glide_max <- 30  # seuil à ajuster — blocs gliding de moins de n points sont absorbés
+
+subset_HF.ID <- subset_HF.ID %>%
+  mutate(
+    block_id_temp = cumsum(phase_merged != lag(phase_merged, default = first(phase_merged)))
+  )
+
+blocks_temp <- subset_HF.ID %>%
+  group_by(block_id_temp, phase_merged) %>%
+  summarise(n_points = n(), .groups = "drop") %>%
+  arrange(block_id_temp) %>%
+  mutate(
+    prev_phase = lag(phase_merged),
+    next_phase = lead(phase_merged),
+    # Gliding court entre deux thermalling → absorbé
+    absorb = phase_merged == "gliding" & 
+             n_points <= n_glide_max & 
+             prev_phase == "thermalling" & 
+             next_phase == "thermalling"
+  )
+
+# Appliquer l'absorption au dataframe
+subset_HF.ID <- subset_HF.ID %>%
+  left_join(blocks_temp %>% select(block_id_temp, absorb), by = "block_id_temp") %>%
+  mutate(
+    phase_final = ifelse(absorb, "thermalling", phase_merged)
+  )
+
+# Étape 3 : blocs finaux
+subset_HF.ID <- subset_HF.ID %>%
+  mutate(
+    block_id = cumsum(phase_final != lag(phase_final, default = first(phase_final)))
+  )
+
+# Étape 4 : comptage
+n_min <- 36
+
+blocks <- subset_HF.ID %>%
+  group_by(block_id, phase_final) %>%
+  summarise(
+    start_time = min(timestamp),
+    end_time   = max(timestamp),
+    n_points   = n(),
+    .groups    = "drop"
+  ) %>%
+  arrange(block_id) %>%
+  mutate(
+    prev_phase = lag(phase_final),
+    next_phase = lead(phase_final)
+  )
+
+thermals <- blocks %>%
+  filter(
+    phase_final == "thermalling",
+    n_points >= n_min,
+    prev_phase %in% c("gliding", "other", NA),
+    next_phase %in% c("gliding", "other", NA)
+  )
+
+
+## Enlève les ascendances de moins de 130m "faux thermiques"
+
+# Calcul des gain d'altitudes par thermiques
+thermals <- blocks %>%
+  filter(phase_final == "thermalling") %>%
+  # Joindre les données brutes pour calculer dZ par bloc
+  left_join(
+    subset_HF.ID %>%
+      group_by(block_id) %>%
+      summarise(
+        dZ        = max(Z.m) - min(Z.m),          # gain d'altitude brut
+        dZ_net    = last(Z.m) - first(Z.m),        # gain net (début → fin)
+        mean_Vz   = mean(Vz, na.rm = TRUE),        # vitesse verticale moyenne
+        .groups = "drop"
+      ),
+    by = "block_id"
+  ) %>%
+  filter(
+    n_points  >= n_min,
+    dZ_net    >= 20,     # gain net minimum en mètres — à calibrer
+    mean_Vz   >= 0,      # vitesse verticale moyenne positive
+    prev_phase %in% c("gliding", "other", NA),
+    next_phase %in% c("gliding", "other", NA)
+  )
+
+# Retrait des thermiques avec des gains < 130m
+
+thermals <- blocks %>%
+  filter(phase_final == "thermalling") %>%
+  left_join(
+    subset_HF.ID %>%
+      group_by(block_id) %>%
+      summarise(
+        dZ      = max(Z.m) - min(Z.m),
+        dZ_net  = last(Z.m) - first(Z.m),
+        mean_Vz = mean(Vz, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = "block_id"
+  ) %>%
+  filter(
+    n_points  >= n_min,
+    dZ_net    >= 130,    # élimine la majorité des faux positifs
+    mean_Vz   >= 0.5,    # élimine les blocs à faible ascendance
+    prev_phase %in% c("gliding", "other", NA),
+    next_phase %in% c("gliding", "other", NA)
+  )
+
+# Affichage du compte
+cat("Nombre de thermiques :", nrow(thermals), "\n")
+thermals
+
+
+
+## Représentation du track HF.ID
+
+# Dates extraites automatiquement depuis les thermiques détectés
+start_date <- min(thermals$start_time)
+end_date   <- max(thermals$end_time)
+
+# Filtrer sur la plage temporelle
+segment_to_plot <- subset_HF.ID[
+  subset_HF.ID$timestamp >= start_date &
+  subset_HF.ID$timestamp <= end_date, 
+]
+
+segment_to_plot <- segment_to_plot[order(segment_to_plot$timestamp), ]
+
+# Couleurs basées sur phase_final
+segment_to_plot$color <- ifelse(segment_to_plot$phase_final == "thermalling", "red",
+                         ifelse(segment_to_plot$phase_final == "gliding",     "blue",
+                                                                               "grey"))
+# Plot 3D
+rgl::plot3d(
+  x    = segment_to_plot$X.m,
+  y    = segment_to_plot$Y.m,
+  z    = segment_to_plot$Z.m,
+  col  = segment_to_plot$color,
+  xlab = "X (m)",
+  ylab = "Y (m)",
+  zlab = "Z (m)",
+  main = paste("HF.ID :", unique(segment_to_plot$HF.ID))
+)
+
+# Légende
+rgl::legend3d(
+  "topright",
+  legend = c("Thermalling", "Gliding", "Other"),
+  col    = c("red", "blue", "grey"),
+  pch    = 16,
+  cex    = 1
+)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### Autre méthode avec prise en compte du gain d'altitude 
+
+
+library(tidyr)
+######
+subset_HF.ID <- Circaetus_gallicus3[Circaetus_gallicus3$HF.ID == 48, ]
+
+# Seuils
+n_min_thermal <- 12   # 36 sec = 12 points à 3s/pt
+n_gap_max     <- 20   # 60 sec = 20 points — interruption absorbée si < ça
+
+# Étape 1 : phase_clean
+subset_HF.ID <- subset_HF.ID %>%
+  arrange(timestamp) %>%
+  mutate(
+    phase_clean = ifelse(is.na(as.character(flight_phase_smooth)), "other",
+                         as.character(flight_phase_smooth))
+  )
+
+# Étape 2 : blocs bruts
+subset_HF.ID <- subset_HF.ID %>%
+  mutate(
+    block_id_temp = cumsum(phase_clean != lag(phase_clean, default = first(phase_clean)))
+  )
+
+# Étape 3 : résumé des blocs bruts
+blocks_temp <- subset_HF.ID %>%
+  group_by(block_id_temp, phase_clean) %>%
+  summarise(n_points = n(), .groups = "drop") %>%
+  arrange(block_id_temp) %>%
+  mutate(
+    # Identifier les blocs thermalling
+    is_thermal = phase_clean == "thermalling",
+    # Numéroter les groupes de blocs entre deux thermalling
+    thermal_group_before = cumsum(is_thermal),
+    thermal_group_after  = rev(cumsum(rev(is_thermal)))
+  )
+
+# Calculer la taille totale du gap (other + gliding combinés) entre deux thermalling
+gap_sizes <- blocks_temp %>%
+  filter(!is_thermal) %>%
+  group_by(thermal_group_before) %>%
+  summarise(
+    gap_total_points = sum(n_points),
+    gap_phases       = paste(phase_clean, collapse = "+"),
+    # Vérifier qu'il y a bien un thermalling de chaque côté
+    has_thermal_after = any(thermal_group_after > 0),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    absorb_gap = gap_total_points < n_gap_max & has_thermal_after
+  )
+
+# Joindre l'info d'absorption sur les blocs
+blocks_temp <- blocks_temp %>%
+  left_join(
+    gap_sizes %>% select(thermal_group_before, absorb_gap),
+    by = "thermal_group_before"
+  ) %>%
+  mutate(
+    absorb = !is_thermal & replace_na(absorb_gap, FALSE)
+  )
+
+# Étape 4 : appliquer l'absorption
+subset_HF.ID <- subset_HF.ID %>%
+  left_join(blocks_temp %>% select(block_id_temp, absorb), by = "block_id_temp") %>%
+  mutate(
+    phase_final = ifelse(absorb, "thermalling", phase_clean)
+  )
+
+# Étape 5 : blocs finaux
+subset_HF.ID <- subset_HF.ID %>%
+  mutate(
+    block_id = cumsum(phase_final != lag(phase_final, default = first(phase_final)))
+  )
+
+# Étape 6 : résumé des blocs finaux
+blocks <- subset_HF.ID %>%
+  group_by(block_id, phase_final) %>%
+  summarise(
+    start_time = min(timestamp),
+    end_time   = max(timestamp),
+    n_points   = n(),
+    .groups    = "drop"
+  ) %>%
+  arrange(block_id) %>%
+  mutate(
+    prev_phase = lag(phase_final),
+    next_phase = lead(phase_final)
+  )
+
+# Étape 7 : thermiques valides
+thermals <- blocks %>%
+  filter(
+    phase_final == "thermalling",
+    n_points    >= n_min_thermal,
+    prev_phase  %in% c("gliding", "other", NA),
+    next_phase  %in% c("gliding", "other", NA)
+  )
+
+
+## Enlève les ascendances de moins de 130m "faux thermiques"
+
+# Calcul des gain d'altitudes par thermiques
+thermals <- blocks %>%
+  filter(phase_final == "thermalling") %>%
+  # Joindre les données brutes pour calculer dZ par bloc
+  left_join(
+    subset_HF.ID %>%
+      group_by(block_id) %>%
+      summarise(
+        dZ        = max(Z.m) - min(Z.m),          # gain d'altitude brut
+        dZ_net    = last(Z.m) - first(Z.m),        # gain net (début → fin)
+        mean_Vz   = mean(Vz, na.rm = TRUE),        # vitesse verticale moyenne
+        .groups = "drop"
+      ),
+    by = "block_id"
+  ) %>%
+  filter(
+    n_points  >= n_min,
+    dZ_net    >= 20,     # gain net minimum en mètres — à calibrer
+    mean_Vz   >= 0,      # vitesse verticale moyenne positive
+    prev_phase %in% c("gliding", "other", NA),
+    next_phase %in% c("gliding", "other", NA)
+  )
+
+# Retrait des thermiques avec des gains < 130m
+
+thermals <- blocks %>%
+  filter(phase_final == "thermalling") %>%
+  left_join(
+    subset_HF.ID %>%
+      group_by(block_id) %>%
+      summarise(
+        dZ      = max(Z.m) - min(Z.m),
+        dZ_net  = last(Z.m) - first(Z.m),
+        mean_Vz = mean(Vz, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = "block_id"
+  ) %>%
+  filter(
+    n_points  >= n_min,
+    dZ_net    >= 130,    # élimine la majorité des faux positifs
+    mean_Vz   >= 0.3,    # élimine les blocs à faible ascendance
+    prev_phase %in% c("gliding", "other", NA),
+    next_phase %in% c("gliding", "other", NA)
+  )
+
+
+cat("Nombre de thermiques :", nrow(thermals), "\n")
+####
+
+
+
+## Représentation du track HF.ID
+
+# Dates extraites automatiquement depuis les thermiques détectés
+start_date <- min(thermals$start_time)
+end_date   <- max(thermals$end_time)
+
+# Filtrer sur la plage temporelle
+segment_to_plot <- subset_HF.ID[
+  subset_HF.ID$timestamp >= start_date &
+  subset_HF.ID$timestamp <= end_date, 
+]
+
+segment_to_plot <- segment_to_plot[order(segment_to_plot$timestamp), ]
+
+# Couleurs basées sur phase_final
+segment_to_plot$color <- ifelse(segment_to_plot$phase_final == "thermalling", "red",
+                         ifelse(segment_to_plot$phase_final == "gliding",     "blue",
+                                                                               "grey"))
+# Plot 3D
+rgl::plot3d(
+  x    = segment_to_plot$X.m,
+  y    = segment_to_plot$Y.m,
+  z    = segment_to_plot$Z.m,
+  col  = segment_to_plot$color,
+  xlab = "X (m)",
+  ylab = "Y (m)",
+  zlab = "Z (m)",
+  main = paste("HF.ID :", unique(segment_to_plot$HF.ID))
+)
+
+# Légende
+rgl::legend3d(
+  "topright",
+  legend = c("Thermalling", "Gliding", "Other"),
+  col    = c("red", "blue", "grey"),
+  pch    = 16,
+  cex    = 1
+)
+```
+
+# Nombre de thermiques par heure : Avec tous les tracks \> 30min
+
+Attention si on change ce seuil il faut également le modifier dans l'exclusion des tracks sinueux
+
+```{r}
+# Fonction qui compte les thermiques pour un HF.ID donné
+compter_thermiques <- function(data, n_glide_max = 5, n_min = 36) {
+  
+  data <- data %>%
+    arrange(timestamp) %>%
+    mutate(
+      phase_clean  = ifelse(is.na(as.character(flight_phase_smooth)), "other",
+                            as.character(flight_phase_smooth)),
+      prev_phase   = lag(phase_clean),
+      next_phase   = lead(phase_clean),
+      phase_merged = case_when(
+        phase_clean == "other" & prev_phase == "thermalling" & next_phase == "thermalling" ~ "thermalling",
+        TRUE ~ phase_clean
+      ),
+      block_id_temp = cumsum(phase_merged != lag(phase_merged, default = first(phase_merged)))
+    )
+  
+  blocks_temp <- data %>%
+    group_by(block_id_temp, phase_merged) %>%
+    summarise(n_points = n(), .groups = "drop") %>%
+    arrange(block_id_temp) %>%
+    mutate(
+      prev_phase = lag(phase_merged),
+      next_phase = lead(phase_merged),
+      absorb = phase_merged == "gliding" &
+               n_points <= n_glide_max &
+               prev_phase == "thermalling" &
+               next_phase == "thermalling"
+    )
+  
+  data <- data %>%
+    left_join(blocks_temp %>% select(block_id_temp, absorb), by = "block_id_temp") %>%
+    mutate(
+      phase_final = ifelse(absorb == TRUE, "thermalling", phase_merged),
+      block_id    = cumsum(phase_final != lag(phase_final, default = first(phase_final)))
+    )
+  
+  blocks <- data %>%
+    group_by(block_id, phase_final) %>%
+    summarise(n_points = n(), .groups = "drop") %>%
+    arrange(block_id) %>%
+    filter(phase_final == "thermalling", n_points >= n_min)
+  
+  return(nrow(blocks))
+}
+
+
+tableau_thermiques <- Circaetus_gallicus3_jour %>%
+  group_by(HF.ID) %>%
+  summarise(
+    ID                   = first(individuals),
+    timestamp_debut      = first(timestamp),
+    timestamp_fin        = last(timestamp),
+    duree_mins           = as.numeric(difftime(last(timestamp), first(timestamp), units = "mins")),
+    mins_depuis_lever    = first(mins_since_sunrise),
+    n_thermiques         = compter_thermiques(pick(everything())),
+    .groups              = "drop"
+  ) %>%
+  filter(duree_mins >= 30) %>%
+  mutate(thermiques_par_heure = n_thermiques / duree_mins * 60) %>%
+  arrange(ID, timestamp_debut)
+
+tableau_thermiques
+
+cat("Moyenne thermiques/heure :", round(mean(tableau_thermiques$thermiques_par_heure), 2), "\n")
+cat("SD :", round(sd(tableau_thermiques$thermiques_par_heure), 2), "\n")
+```
+
+## Comparaison avec des tracks de réellement 1h
+
+```{r}
+resultats_1h <- Circaetus_gallicus3_jour %>%
+  filter(HF.ID %in% tableau_tracks_1h_jour$HF.ID) %>%
+  group_by(HF.ID) %>%
+  summarise(
+    ID                   = first(individuals),
+    timestamp_debut      = first(timestamp),
+    timestamp_fin        = last(timestamp),
+    duree_mins           = as.numeric(difftime(last(timestamp), first(timestamp), units = "mins")),
+    mins_depuis_lever    = first(mins_since_sunrise),
+    n_thermiques         = compter_thermiques(pick(everything())),
+    .groups              = "drop"
+  ) %>%
+  mutate(thermiques_par_heure = n_thermiques / duree_mins * 60)
+
+resultats_1h
+
+cat("Moyenne thermiques/heure :", round(mean(resultats_1h$thermiques_par_heure), 2), "\n")
+cat("SD :", round(sd(resultats_1h$thermiques_par_heure), 2), "\n")
+
+# Comparaison
+
+# Vérification des effectifs
+cat("N tracks >= 30 min :", nrow(tableau_thermiques), "\n")
+cat("N tracks ~1h :", nrow(resultats_1h), "\n")
+
+# Distribution pour voir s'il y a des outliers
+summary(resultats_1h$thermiques_par_heure)
+hist(resultats_1h$thermiques_par_heure, 
+     main = "Distribution thermiques/heure",
+     xlab = "Thermiques/heure")
+```
+
+# Gain d'altitude par thermique et durée
+
+```{r}
+decrire_thermiques <- function(data, n_glide_max = 5, n_min = 36) {
+  
+  data <- data %>%
+    arrange(timestamp) %>%
+    mutate(
+      phase_clean  = ifelse(is.na(as.character(flight_phase_smooth)), "other",
+                            as.character(flight_phase_smooth)),
+      prev_phase   = lag(phase_clean),
+      next_phase   = lead(phase_clean),
+      phase_merged = case_when(
+        phase_clean == "other" & prev_phase == "thermalling" & next_phase == "thermalling" ~ "thermalling",
+        TRUE ~ phase_clean
+      ),
+      block_id_temp = cumsum(phase_merged != lag(phase_merged, default = first(phase_merged)))
+    )
+  
+  blocks_temp <- data %>%
+    group_by(block_id_temp, phase_merged) %>%
+    summarise(n_points = n(), .groups = "drop") %>%
+    arrange(block_id_temp) %>%
+    mutate(
+      prev_phase = lag(phase_merged),
+      next_phase = lead(phase_merged),
+      absorb = phase_merged == "gliding" &
+               n_points <= n_glide_max &
+               prev_phase == "thermalling" &
+               next_phase == "thermalling"
+    )
+  
+  data <- data %>%
+    left_join(blocks_temp %>% select(block_id_temp, absorb), by = "block_id_temp") %>%
+    mutate(
+      phase_final = ifelse(absorb == TRUE, "thermalling", phase_merged),
+      block_id    = cumsum(phase_final != lag(phase_final, default = first(phase_final)))
+    )
+  
+  thermals <- data %>%
+    group_by(block_id, phase_final) %>%
+    summarise(
+      individuals   = first(individuals),
+      start_time    = min(timestamp),
+      end_time      = max(timestamp),
+      start_alt     = first(Z.m),
+      end_alt       = last(Z.m),
+      gain_altitude = end_alt - start_alt,
+      duration_sec  = as.numeric(difftime(end_time, start_time, units = "secs")),
+      n_points      = n(),
+      .groups       = "drop"
+    ) %>%
+    mutate(
+      prev_phase = lag(phase_final),
+      next_phase = lead(phase_final)
+    ) %>%
+    filter(
+      phase_final == "thermalling",
+      n_points    >= n_min,
+      prev_phase  %in% c("gliding", "other", NA),
+      next_phase  %in% c("gliding", "other", NA)
+    )
+  
+  return(thermals)
+}
+
+# Appliquer sur tous les tracks >= 30 min  ← seul changement
+age_lookup <- Circaetus_gallicus3_jour %>%
+  select(HF.ID, age_group) %>%
+  distinct()
+thermals_all <- Circaetus_gallicus3_jour %>%
+  group_by(HF.ID) %>%
+  mutate(duree_mins = as.numeric(difftime(last(timestamp), first(timestamp), units = "mins"))) %>%
+  filter(duree_mins >= 30) %>%
+  group_by(HF.ID) %>%
+  group_modify(~ decrire_thermiques(.x)) %>%
+  ungroup() %>%
+  left_join(age_lookup, by = "HF.ID")
+
+
+cat("Gain altitude moyen (m) :", round(mean(thermals_all$gain_altitude, na.rm = TRUE), 2), "\n")
+cat("SD gain altitude :", round(sd(thermals_all$gain_altitude, na.rm = TRUE), 2), "\n")
+cat("Durée moyenne (sec) :", round(mean(thermals_all$duration_sec, na.rm = TRUE), 2), "\n")
+cat("SD durée :", round(sd(thermals_all$duration_sec, na.rm = TRUE), 2), "\n")
+
+table(thermals_all$age_group, useNA = "always")
+```
+
+# Métriques comparés par catégories
+
+## Récupération de age_group et season
+
+```{r}
+str(Circaetus_gallicus3_jour)
+Circaetus_gallicus3_jour$season <- as.factor(Circaetus_gallicus3_jour$season)
+
+age_lookup <- Circaetus_gallicus3_jour %>%
+  select(HF.ID, age_group) %>%
+  distinct()
+season_lookup <- Circaetus_gallicus3_jour %>%
+  select(HF.ID, season) %>%
+  distinct()
+
+tableau_thermiques <- tableau_thermiques %>%
+  left_join(age_lookup, by = "HF.ID") %>%
+  left_join(season_lookup, by = "HF.ID")
+table(tableau_thermiques$age_group, useNA = "always")
+table(tableau_thermiques$season, useNA = "always")
+
+thermals_all <- thermals_all %>%
+  select(-any_of(c("age_group", "age_group.x", "age_group.y"))) %>%
+  left_join(age_lookup, by = "HF.ID") %>%
+  left_join(season_lookup, by = "HF.ID")
+table(thermals_all$age_group, useNA = "always")
+table(thermals_all$season, useNA = "always")
+```
+
+## Récupération de 1 comp par HF.ID et 1 drift_ratio moyen par HF.ID
+
+```{r}
+#| eval: false
+#| include: false
+##### Tableau thermique
+
+str(Circaetus_gallicus3_jour)
+str(tableau_thermiques)
+
+## comp
+
+# Comp dominant par HF.ID
+comp_dominant <- Circaetus_gallicus3_jour %>%
+  group_by(HF.ID) %>%
+  count(comp) %>%
+  slice_max(n, n = 1, with_ties = FALSE) %>%
+  dplyr::select(HF.ID, comp_dominant = comp)
+
+# Jointure
+tableau_thermiques <- tableau_thermiques %>%
+  left_join(comp_dominant, by = "HF.ID")
+
+str(tableau_thermiques)
+tableau_thermiques$comp_dominant <- as.factor (tableau_thermiques$comp_dominant)
+
+
+##
+comp_proportions <- Circaetus_gallicus3_jour %>%
+  group_by(HF.ID) %>%
+  count(comp) %>%
+  mutate(prop = n / sum(n)) %>%
+  arrange(HF.ID, desc(prop))
+comp_proportions #Très bien proportion de 1 (Rq : La majorité des tracks sont < 1h et 1 comp / track)
+unique(comp_proportions$prop) # Forcément 1
+
+## drift_ratio
+class(Circaetus_gallicus3_jour$drift_ratio)
+Circaetus_gallicus3_jour$drift_ratio <- as.numeric(
+  Circaetus_gallicus3_jour$drift_ratio
+)
+table(Circaetus_gallicus3_jour$drift_ratio)
+
+drift_ratio_moyen <- Circaetus_gallicus3_jour %>%
+  group_by(HF.ID) %>%
+  summarise(
+    drift_ratio_moyen = mean(drift_ratio, na.rm = TRUE)
+  )
+head(drift_ratio_moyen)
+summary(drift_ratio_moyen$drift_ratio_moyen)
+
+
+tableau_thermiques <- tableau_thermiques %>%
+  left_join(drift_ratio_moyen, by = "HF.ID")
+
+summary(tableau_thermiques$drift_ratio_moyen)
+
+
+##### thermals_all : Gain d'altitude = 1 ligne par thermique valide
+
+
+```
+
+## Lme nb thermiques/heure by age_group & season
+
+```{r}
+conflicts_prefer(lmerTest::lmer)
+conflicts_prefer(ggplot2::annotate)
+library(performance)
+library(ggeffects)
+
+str(tableau_thermiques)
+tableau_thermiques$ID <- as.factor(tableau_thermiques$ID)
+unique(tableau_thermiques$ID)
+
+# lme
+lme_ther1 <- lmer(thermiques_par_heure ~ age_group + season + (1|ID), data = tableau_thermiques)
+summary(lme_ther1)
+lme_ther2 <- lmer(thermiques_par_heure ~ age_group + season + (1|ID) + age_group:season, data = tableau_thermiques)
+summary(lme_ther2)
+AIC(lme_ther1, lme_ther2) # lm_height2
+summary(lme_ther2)
+r2(lme_ther2) # => Random effect variances not available donc => lm simple
+
+## Représentation lme
+#####
+library(stringr)
+library(ggeffects)
+library(ggplot2)
+
+# Effets prédits
+pred <- ggpredict(lme_ther2, terms = c("season", "age_group"))
+new_data <- as.data.frame(pred)
+colnames(new_data)[colnames(new_data) == "x"]     <- "season"
+colnames(new_data)[colnames(new_data) == "group"] <- "age_group"
+
+# Valeurs R²
+r2_cond <- 0.026
+r2_marg <- 0.006
+#r2_label <- paste0("Marginal R² = ", r2_marg, " | Conditional R² = ", r2_cond)
+
+new_data$season_num <- ifelse(new_data$season == "autumn", 0, 0.22)
+tableau_thermiques$season_num <- ifelse(tableau_thermiques$season == "autumn", 0, 0.22)
+
+ggplot(new_data, aes(x = season_num, y = predicted,
+                     fill = age_group, group = age_group)) +
+  geom_col(position = position_dodge(0.16),
+           width = 0.16,
+           alpha = 0.7,
+           color = "black") +
+  geom_jitter(data = tableau_thermiques,
+            aes(x = season_num, y = thermiques_par_heure, color = age_group),
+            position = position_jitterdodge(jitter.width = 0.025, dodge.width = 0.16),
+            alpha = 0.20, size = 1, inherit.aes = FALSE) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.045, linewidth = 0.7,
+                position = position_dodge(0.16)) +
+  scale_fill_manual(values = c("adult" = "#00B074", "juvenile" = "#FF9F1C"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_color_manual(values = c("adult" = "#00693F", "juvenile" = "#C96A00"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_x_continuous(breaks = c(0, 0.22),
+                      labels = c("Autumn", "Spring"),
+                      limits = c(-0.1, 0.32)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 20)) +   # <- plus de graduations
+  coord_cartesian(ylim = c(0, 20)) +
+  labs(
+    x        = "Season",
+    y        = "Number of thermals per hour",
+    fill     = NULL, color = NULL
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.02, 0.96),
+    legend.justification = c(0, 1),
+    legend.background = element_rect(fill = "white", color = NA),
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(size = 9, color = "grey50"),
+    plot.caption    = element_text(size = 8, color = "grey50", hjust = 0),
+    axis.text.y     = element_text(size = 12)   # <- taille des chiffres en ordonnée
+  )
+ggsave("C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/Figures principales/thermals_by_season.png", 
+       width = 4, height = 5, dpi = 300)
+
+
+#### Panel A : Nombre de thermiques par heure ####
+p_nombre <- ggplot(new_data, aes(x = season_num, y = predicted,
+                     fill = age_group, group = age_group)) +
+  geom_col(position = position_dodge(0.16), width = 0.16, alpha = 0.7, color = "black") +
+  geom_jitter(data = tableau_thermiques,
+            aes(x = season_num, y = thermiques_par_heure, color = age_group),
+            position = position_jitterdodge(jitter.width = 0.025, dodge.width = 0.16),
+            alpha = 0.20, size = 1, inherit.aes = FALSE) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.045, linewidth = 0.7, position = position_dodge(0.16)) +
+  scale_fill_manual(values = c("adult" = "#00B074", "juvenile" = "#FF9F1C"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_color_manual(values = c("adult" = "#00693F", "juvenile" = "#C96A00"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_x_continuous(breaks = c(0, 0.22), labels = c("Autumn", "Spring"), limits = c(-0.1, 0.32)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 20)) +
+  coord_cartesian(ylim = c(0, 20)) +
+  labs(x = "Season", y = "Number of thermals per hour", fill = NULL, color = NULL) +
+  theme_classic(base_size = 18) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 9, color = "grey50"),
+    plot.caption  = element_text(size = 8, color = "grey50", hjust = 0),
+    axis.text.y   = element_text(size = 12)
+  )
+
+
+## Taille d'effet
+
+conflicts_prefer(dplyr::select)
+library(dplyr)
+library(tidyr)
+
+# Variation saisonnière pour chaque classe d'âge
+var_season_nb_ther <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = season, values_from = predicted) %>%
+  mutate(
+    variation_percent = (spring - autumn) / autumn * 100
+  )
+
+var_season_nb_ther
+
+# Variation entre âges pour chaque saison
+var_age_nb_ther <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = age_group, values_from = predicted) %>%
+  mutate(
+    variation_percent = (juvenile - adult) / adult * 100
+  )
+
+var_age_nb_ther
+```
+
+### N stat nb ther
+
+```{r}
+tableau_thermiques$age_group <- as.factor (tableau_thermiques$age_group)
+summary(tableau_thermiques)
+
+# nb ID
+length(unique(tableau_thermiques$ID))
+```
+
+## Lme incluant le comportement de réponse au vent
+
+### Comp
+
+```{r}
+#| eval: false
+#| include: false
+conflict_prefer("lmer", "lmerTest")
+
+#### Comp
+
+str(tableau_thermiques)
+# lme
+lme_ther3 <- lmer(thermiques_par_heure ~ comp_dominant + season + (1|ID), data = tableau_thermiques)
+summary(lme_ther3)
+lme_ther4 <- lmer(thermiques_par_heure ~ comp_dominant + age_group + (1|ID), data = tableau_thermiques)
+summary(lme_ther4)
+
+lme_ther5 <- lmer(thermiques_par_heure ~ comp_dominant * season + (1|ID), data = tableau_thermiques)
+summary(lme_ther5)
+lme_ther6 <- lmer(thermiques_par_heure ~ comp_dominant * age_group + (1|ID), data = tableau_thermiques)
+summary(lme_ther6)
+
+lme_ther6 <- lmer(thermiques_par_heure ~ comp_dominant + age_group + season + (1|ID), data = tableau_thermiques)
+summary(lme_ther6)
+
+lme_ther7 <- lmer(thermiques_par_heure ~ comp_dominant * season * age_group + (1|ID), data = tableau_thermiques)
+summary(lme_ther7)
+```
+
+### Drift_ratio
+
+```{r}
+#| eval: false
+#| include: false
+conflict_prefer("lmer", "lmerTest")
+
+#### drift_ratio_moyen
+tableau_thermiques$log_drift_ratio <- log1p(tableau_thermiques$drift_ratio_moyen)
+summary(tableau_thermiques$log_drift_ratio) # 75 % des valeurs sont inférieures à 0.21.
+hist(tableau_thermiques$log_drift_ratio) # oula
+
+
+library(lme4)
+
+lme_ther3 <- lmer(
+  thermiques_par_heure ~ log_drift_ratio + season + (1|ID),
+  data = tableau_thermiques
+)
+summary(lme_ther3)
+
+lme_ther4 <- lmer(
+  thermiques_par_heure ~ log_drift_ratio + age_group + (1|ID),
+  data = tableau_thermiques
+)
+summary(lme_ther4)
+
+lme_ther5 <- lmer(
+  thermiques_par_heure ~ log_drift_ratio * season + (1|ID),
+  data = tableau_thermiques
+)
+summary(lme_ther5)
+
+lme_ther6 <- lmer(
+  thermiques_par_heure ~ log_drift_ratio * age_group + (1|ID),
+  data = tableau_thermiques
+)
+summary(lme_ther6)
+
+lme_ther7 <- lmer(
+  thermiques_par_heure ~ log_drift_ratio + age_group + season + (1|ID),
+  data = tableau_thermiques
+)
+summary(lme_ther7)
+
+lme_ther8 <- lmer(
+  thermiques_par_heure ~ log_drift_ratio * season * age_group + (1|ID),
+  data = tableau_thermiques
+)
+summary(lme_ther8)
+```
+
+## Lme gain d'altitude
+
+```{r}
+str(thermals_all)
+
+# lme
+lme_gt1 <- lmer(gain_altitude ~ age_group + season + (1|individuals), data = thermals_all)
+summary(lme_gt1)
+lme_gt2 <- lmer(gain_altitude ~ age_group + season + (1|individuals) + age_group:season, data = thermals_all)
+summary(lme_gt2) # Pas de singular fit
+
+AIC(lme_gt1, lme_gt2) # lm_height2
+summary(lme_gt2)
+r2(lme_gt2) # Random effect OK
+
+# Interaction S
+#Adultes : printemps → -115m vs automne
+#Juvéniles : printemps → -115 + 165 = +50m vs automne
+
+
+## Représentation lme
+#####
+library(stringr)
+library(ggeffects)
+library(ggplot2)
+
+# Effets prédits
+pred <- ggpredict(lme_gt2, terms = c("season", "age_group"))
+new_data <- as.data.frame(pred)
+colnames(new_data)[colnames(new_data) == "x"]     <- "season"
+colnames(new_data)[colnames(new_data) == "group"] <- "age_group"
+
+# Valeurs R²
+r2_cond <- 0.030
+r2_marg <- 0.014
+#r2_label <- paste0("Marginal R² = ", r2_marg, " | Conditional R² = ", r2_cond)
+
+new_data$season_num <- ifelse(new_data$season == "autumn", 0, 0.22)
+thermals_all$season_num <- ifelse(thermals_all$season == "autumn", 0, 0.22)
+
+ggplot(new_data, aes(x = season_num, y = predicted,
+                     fill = age_group, group = age_group)) +
+  geom_col(position = position_dodge(0.16),
+           width = 0.16,
+           alpha = 0.7,
+           color = "black") +
+  geom_jitter(data = thermals_all,
+            aes(x = season_num, y = gain_altitude, color = age_group),
+            position = position_jitterdodge(jitter.width = 0.025, dodge.width = 0.16),
+            alpha = 0.10, size = 1, inherit.aes = FALSE) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.045, linewidth = 0.7,
+                position = position_dodge(0.16)) +
+  scale_fill_manual(values = c("adult" = "#00B074", "juvenile" = "#FF9F1C"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_color_manual(values = c("adult" = "#00693F", "juvenile" = "#C96A00"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_x_continuous(breaks = c(0, 0.22),
+                      labels = c("Autumn", "Spring"),
+                      limits = c(-0.1, 0.32)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10)) +   # <- plus de graduations
+  labs(
+    x        = "Season",
+    y        = "Altitude gain per thermal (m)",
+    fill     = NULL, color = NULL
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.02, 0.96),
+    legend.justification = c(0, 1),
+    legend.background = element_rect(fill = "white", color = NA),
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(size = 9, color = "grey50"),
+    plot.caption    = element_text(size = 8, color = "grey50", hjust = 0),
+    axis.text.y     = element_text(size = 12)   # <- taille des chiffres en ordonnée
+  )
+
+ggsave("C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/Figures principales/altitude_gain_thermals_by_season.png", 
+       width = 4, height = 5, dpi = 300)
+
+
+#### Panel C : Gain d'altitude par thermique ####
+p_altitude <- ggplot(new_data, aes(x = season_num, y = predicted,
+                     fill = age_group, group = age_group)) +
+  geom_col(position = position_dodge(0.16), width = 0.16, alpha = 0.7, color = "black") +
+  geom_jitter(data = thermals_all,
+            aes(x = season_num, y = gain_altitude, color = age_group),
+            position = position_jitterdodge(jitter.width = 0.025, dodge.width = 0.16),
+            alpha = 0.10, size = 1, inherit.aes = FALSE) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.045, linewidth = 0.7, position = position_dodge(0.16)) +
+  scale_fill_manual(values = c("adult" = "#00B074", "juvenile" = "#FF9F1C"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_color_manual(values = c("adult" = "#00693F", "juvenile" = "#C96A00"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_x_continuous(breaks = c(0, 0.22), labels = c("Autumn", "Spring"), limits = c(-0.1, 0.32)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10)) +
+  labs(x = "Season", y = "Altitude gain per thermal (m)", fill = NULL, color = NULL) +
+  theme_classic(base_size = 18) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 9, color = "grey50"),
+    plot.caption  = element_text(size = 8, color = "grey50", hjust = 0),
+    axis.text.y   = element_text(size = 12)
+  )
+
+
+## Taille d'effet
+
+conflicts_prefer(dplyr::select)
+library(dplyr)
+library(tidyr)
+
+# Variation saisonnière pour chaque classe d'âge
+var_season_alt_gain_ther <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = season, values_from = predicted) %>%
+  mutate(
+    variation_percent = (spring - autumn) / autumn * 100
+  )
+
+var_season_alt_gain_ther
+
+# Variation entre âges pour chaque saison
+var_age_alt_gain_ther <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = age_group, values_from = predicted) %>%
+  mutate(
+    variation_percent = (juvenile - adult) / adult * 100
+  )
+
+var_age_alt_gain_ther
+
+
+
+##########
+# En LOG
+
+thermals_all$gain_altitude_logmod <- sign(thermals_all$gain_altitude) * 
+     log(abs(thermals_all$gain_altitude) + 1)
+   
+lme_gt2_log <- lmer(gain_altitude_logmod ~ age_group + season + (1|individuals) + age_group:season, data = thermals_all)
+summary(lme_gt2_log)
+
+
+## Disagnostic des résidus
+
+library(lme4)
+library(performance)
+
+#### Extraction des résidus et valeurs ajustées ####
+res_gt2 <- residuals(lme_gt2_log)
+fitted_gt2 <- fitted(lme_gt2_log)
+
+#### 1. Normalité des résidus ####
+# Histogramme
+hist(res_gt2, breaks = 30, main = "Distribution des résidus", xlab = "Résidus")
+
+# QQ-plot
+qqnorm(res_gt2, main = "QQ-plot des résidus")
+qqline(res_gt2, col = "red", lwd = 2)
+
+#### 2. Homogénéité de la variance (homoscédasticité) ####
+plot(fitted_gt2, res_gt2,
+     xlab = "Valeurs ajustées", ylab = "Résidus",
+     main = "Résidus vs valeurs ajustées")
+abline(h = 0, col = "red", lty = 2)
+
+
+
+## Comparaison avec autre modèle sans log
+
+## Disagnostic des résidus
+
+library(lme4)
+library(performance)
+
+#### Extraction des résidus et valeurs ajustées ####
+res_gt2 <- residuals(lme_gt2)
+fitted_gt2 <- fitted(lme_gt2)
+
+#### 1. Normalité des résidus ####
+# Histogramme
+hist(res_gt2, breaks = 30, main = "Distribution des résidus", xlab = "Résidus")
+
+# QQ-plot
+qqnorm(res_gt2, main = "QQ-plot des résidus")
+qqline(res_gt2, col = "red", lwd = 2)
+
+#### 2. Homogénéité de la variance (homoscédasticité) ####
+plot(fitted_gt2, res_gt2,
+     xlab = "Valeurs ajustées", ylab = "Résidus",
+     main = "Résidus vs valeurs ajustées")
+abline(h = 0, col = "red", lty = 2)
+
+
+## Meilleur avec log
+
+summary(lme_gt2_log)
+r2(lme_gt2)
+```
+
+### N stats gain et duree ther
+
+```{r}
+#
+thermals_all$age_group <- as.factor(thermals_all$age_group)
+summary(thermals_all)
+
+# proportion de négatifs  alt gain
+
+sum(thermals_all$gain_altitude < 0, na.rm = TRUE)
+mean(thermals_all$gain_altitude < 0, na.rm = TRUE)  # proportion directement
+sum(is.na(thermals_all$gain_altitude))  # pour savoir combien de NA il y a
+```
+
+## Lme temps passé par thermique
+
+```{r}
+str(thermals_all)
+
+# lme
+lme_duration1 <- lmer(duration_sec  ~ age_group + season + (1|individuals), data = thermals_all)
+summary(lme_duration1)
+lme_duration2 <- lmer(duration_sec  ~ age_group + season + (1|individuals) + age_group:season, data = thermals_all)
+summary(lme_duration2) # Pas de singular fit
+
+AIC(lme_duration1, lme_duration2) # 
+summary(lme_duration2)
+r2(lme_duration2) # Random effect OK
+
+
+# Représentation lme
+#####
+library(stringr)
+library(ggeffects)
+library(ggplot2)
+
+# Effets prédits
+pred <- ggpredict(lme_duration2, terms = c("season", "age_group"))
+new_data <- as.data.frame(pred)
+colnames(new_data)[colnames(new_data) == "x"]     <- "season"
+colnames(new_data)[colnames(new_data) == "group"] <- "age_group"
+
+# Valeurs R²
+r2_cond <- 0.009
+r2_marg <- 0.005
+#r2_label <- paste0("Marginal R² = ", r2_marg, " | Conditional R² = ", r2_cond)
+
+new_data$season_num <- ifelse(new_data$season == "autumn", 0, 0.22)
+thermals_all$season_num <- ifelse(thermals_all$season == "autumn", 0, 0.22)
+
+ggplot(new_data, aes(x = season_num, y = predicted,
+                     fill = age_group, group = age_group)) +
+  geom_col(position = position_dodge(0.16),
+           width = 0.16,
+           alpha = 0.7,
+           color = "black") +
+  geom_jitter(data = thermals_all,
+            aes(x = season_num, y = duration_sec, color = age_group),
+            position = position_jitterdodge(jitter.width = 0.025, dodge.width = 0.16),
+            alpha = 0.20, size = 1, inherit.aes = FALSE) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.045, linewidth = 0.7,
+                position = position_dodge(0.16)) +
+  scale_fill_manual(values = c("adult" = "#00B074", "juvenile" = "#FF9F1C"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_color_manual(values = c("adult" = "#00693F", "juvenile" = "#C96A00"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_x_continuous(breaks = c(0, 0.22),
+                      labels = c("Autumn", "Spring"),
+                      limits = c(-0.1, 0.32)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10)) +   # <- plus de graduations
+  labs(
+    x        = "Season",
+    y        = "Thermal duration (s)",
+    fill     = NULL, color = NULL
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.02, 0.96),
+    legend.justification = c(0, 1),
+    legend.background = element_rect(fill = "white", color = NA),
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(size = 9, color = "grey50"),
+    plot.caption    = element_text(size = 8, color = "grey50", hjust = 0),
+    axis.text.y     = element_text(size = 12)   # <- taille des chiffres en ordonnée
+  )
+ggsave("C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/Figures principales/thermal_duration_by_season.png", 
+       width = 4, height = 5, dpi = 300)
+
+#### Panel B : Durée des thermiques ####
+p_duree <- ggplot(new_data, aes(x = season_num, y = predicted,
+                     fill = age_group, group = age_group)) +
+  geom_col(position = position_dodge(0.16), width = 0.16, alpha = 0.7, color = "black") +
+  geom_jitter(data = thermals_all,
+            aes(x = season_num, y = duration_sec, color = age_group),
+            position = position_jitterdodge(jitter.width = 0.025, dodge.width = 0.16),
+            alpha = 0.20, size = 1, inherit.aes = FALSE) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.045, linewidth = 0.7, position = position_dodge(0.16)) +
+  scale_fill_manual(values = c("adult" = "#00B074", "juvenile" = "#FF9F1C"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_color_manual(values = c("adult" = "#00693F", "juvenile" = "#C96A00"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_x_continuous(breaks = c(0, 0.22), labels = c("Autumn", "Spring"), limits = c(-0.1, 0.32)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10)) +
+  labs(x = "Season", y = "Thermal duration (s)", fill = NULL, color = NULL) +
+  theme_classic(base_size = 18) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 9, color = "grey50"),
+    plot.caption  = element_text(size = 8, color = "grey50", hjust = 0),
+    axis.text.y   = element_text(size = 12)
+  )
+
+
+## Taille d'effet
+
+conflicts_prefer(dplyr::select)
+library(dplyr)
+library(tidyr)
+
+# Variation saisonnière pour chaque classe d'âge
+var_season_time_ther <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = season, values_from = predicted) %>%
+  mutate(
+    variation_percent = (spring - autumn) / autumn * 100
+  )
+
+var_season_time_ther
+
+# Variation entre âges pour chaque saison
+var_age_time_ther <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = age_group, values_from = predicted) %>%
+  mutate(
+    variation_percent = (juvenile - adult) / adult * 100
+  )
+
+var_age_time_ther
+
+
+### En LOG
+
+str(thermals_all)
+range(thermals_all$duration_sec, na.rm = TRUE)   # vérifier l'absence de 0 ou de négatifs
+
+# lme avec log
+lme_duration1_log <- lmer(log(duration_sec) ~ age_group + season + (1|individuals), data = thermals_all)
+summary(lme_duration1_log)
+
+lme_duration2_log <- lmer(log(duration_sec) ~ age_group + season + (1|individuals) + age_group:season, data = thermals_all)
+summary(lme_duration2_log) # vérifier l'absence de singular fit
+
+AIC(lme_duration1_log, lme_duration2_log)
+
+summary(lme_duration2_log)
+r2(lme_duration2_log)
+
+## Disagnostic des résidus
+
+library(lme4)
+library(performance)
+
+#### Extraction des résidus et valeurs ajustées ####
+res_gt2 <- residuals(lme_duration2_log)
+fitted_gt2 <- fitted(lme_duration2_log)
+
+#### 1. Normalité des résidus ####
+# Histogramme
+hist(res_gt2, breaks = 30, main = "Distribution des résidus", xlab = "Résidus")
+
+# QQ-plot
+qqnorm(res_gt2, main = "QQ-plot des résidus")
+qqline(res_gt2, col = "red", lwd = 2)
+
+#### 2. Homogénéité de la variance (homoscédasticité) ####
+plot(fitted_gt2, res_gt2,
+     xlab = "Valeurs ajustées", ylab = "Résidus",
+     main = "Résidus vs valeurs ajustées")
+abline(h = 0, col = "red", lty = 2)
+
+
+
+## Comparaison avec autre modèle sans log
+
+## Disagnostic des résidus
+
+library(lme4)
+library(performance)
+
+#### Extraction des résidus et valeurs ajustées ####
+res_gt2 <- residuals(lme_duration2)
+fitted_gt2 <- fitted(lme_duration2)
+
+#### 1. Normalité des résidus ####
+# Histogramme
+hist(res_gt2, breaks = 30, main = "Distribution des résidus", xlab = "Résidus")
+
+# QQ-plot
+qqnorm(res_gt2, main = "QQ-plot des résidus")
+qqline(res_gt2, col = "red", lwd = 2)
+
+#### 2. Homogénéité de la variance (homoscédasticité) ####
+plot(fitted_gt2, res_gt2,
+     xlab = "Valeurs ajustées", ylab = "Résidus",
+     main = "Résidus vs valeurs ajustées")
+abline(h = 0, col = "red", lty = 2)
+
+
+### => Meilleurs en log
+
+summary(lme_duration2_log)
+r2(lme_duration2_log)
+```
+
+## Lme gain d'altitude et Drift ratio
+
+```{r}
+#| eval: false
+#| include: false
+lme_gt3 <- lmer(
+  gain_altitude ~ log_drift_ratio + season + (1|ID),
+  data = thermals_all
+)
+summary(lme_gt3)
+
+lme_gt4 <- lmer(
+  gain_altitude ~ log_drift_ratio + age_group + (1|ID),
+  data = thermals_all
+)
+summary(lme_gt4)
+
+lme_gt5 <- lmer(
+  gain_altitude ~ log_drift_ratio * season + (1|ID),
+  data = thermals_all
+)
+summary(lme_gt5)
+
+lme_gt6 <- lmer(
+  gain_altitude ~ log_drift_ratio * age_group + (1|ID),
+  data = thermals_all
+)
+summary(lme_gt6)
+
+lme_gt7 <- lmer(
+  gain_altitude ~ log_drift_ratio + age_group + season + (1|ID),
+  data = thermals_all
+)
+summary(lme_gt7)
+
+lme_gt8 <- lmer(
+  gain_altitude ~ log_drift_ratio * season * age_group + (1|ID),
+  data = thermals_all
+)
+summary(lme_gt8)
+```
+
+# % variation
+
+```{r}
+library(officer)
+library(flextable)
+library(dplyr)
+
+make_ft <- function(df) {
+  df %>%
+    dplyr::select(season, adult, juvenile, variation_percent, variable) %>%
+    flextable() %>%
+    autofit() %>%
+    theme_vanilla() %>%
+    bold(part = "header")
+}
+
+doc <- read_docx()
+
+# Tableau 1 : Age effect on thermal variables
+var_age_thermals <- bind_rows(
+  var_age_nb_ther %>% mutate(variable = "Number of thermals"),
+  var_age_alt_gain_ther  %>% mutate(variable = "Altitude gain per thermal"),
+  var_age_time_ther    %>% mutate(variable = "Thermal durations")
+)
+
+doc <- body_add_par(
+  doc,
+  "Age-related variation in flight performance variables",
+  style = "heading 1"
+)
+
+doc <- body_add_flextable(
+  doc,
+  value = make_ft(var_age_thermals)
+)
+
+
+print(
+  doc,
+  target = "C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/variation_age_thermals.docx"
+)
+```

@@ -1,0 +1,2948 @@
+---
+title: "Analyse"
+author: "Alice Rodrigues"
+format: pdf
+execute:
+  echo: true    # Affiche le code (false pour cacher)
+  warning: false  # Cache les warnings
+editor: visual
+---
+
+# Libraries
+
+```{r}
+
+#tinytex::install_tinytex()
+#tinytex::tlmgr_path()
+
+library(here)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(sf)
+library(lubridate)
+library(stringr)
+library(geosphere)
+library(lmerTest)
+library(suncalc)
+
+library(multcompView)
+library(multcomp)
+library(emmeans)
+library(agricolae)   # pour HSD.test et lettres
+
+library(ggeffects)
+library(ggplot2)
+library(performance)
+
+library(conflicted)
+```
+
+# Chargement des données
+
+```{r}
+here()
+
+# Tous les points HF et BF : 1 ligne = 1 point
+load(here("Alice/STE_data_preparation_June_2026/2.Data_preparation/2.1_OUTPUT_STE_France_processed_all_A_2026-06-04.RData"))
+# data
+
+# Métafile, informations sur les individus
+OVERVIEW_2026 <- read.csv2(here("Alice/STE_data_preparation_June_2026/2.Data_preparation/2.1_OUTPUT_Overview_individuals_2026-06-04.csv"))
+
+# Données par jours : 1 ligne = 1 jour
+DAYTABLE_2026 <- read.csv(here("Alice/STE_data_preparation_June_2026/2.Data_preparation/2.2_OUTPUT_STE_France_Daytable_2026-06-04.csv"))
+
+# TRACKS HF SPEED
+TRACKS_HF_2026_SPEED <- read.csv(here("Alice/STE_data_preparation_June_2026/2.Data_preparation/data_sub_speed_2026-06-04.csv"))
+
+# TRACKS HF HEIGHT
+TRACKS_HF_2026_HEIGHT <- read.csv(here("Alice/STE_data_preparation_June_2026/2.Data_preparation/data_sub_height_2026-06-04.csv"))
+
+# TRACKS HF ALT
+TRACKS_HF_2026_ALT <- read.csv(here("Alice/STE_data_preparation_June_2026/2.Data_preparation/2.5_OUTPUT_STE_France_HF_track_table_ALT_2026-06-04.csv"))
+
+# Uniquement les HF point par point : 1 ligne = 1 point de HF
+load(here("Alice/STE_data_preparation_June_2026/2.Data_preparation/2.1_OUTPUT_STE_France_processed_HF_A_2026-06-04.RData"))
+DATA_HF <- data_HF
+
+# HF et BF : 1 ligne = 1 point toute les 5min
+load(here("Alice/STE_data_preparation_June_2026/2.Data_preparation/2.1_OUTPUT_STE_France_processed_sub5_A_2026-06-04.RData"))
+# data_sub5
+
+```
+
+```{r}
+# Gestion du format des colonnes
+
+#str(TRACKS_HF_2026_SPEED)
+TRACKS_HF_2026_SPEED <- TRACKS_HF_2026_SPEED %>%
+  mutate(
+    date = as.Date(timestamp),
+    across(c(
+      individual.local.identifier, age_CY, age_year,
+      country
+    ), as.factor)
+  )
+
+#str(TRACKS_HF_2026_HEIGHT)
+TRACKS_HF_2026_HEIGHT <- TRACKS_HF_2026_HEIGHT %>%
+  mutate(
+    date = as.Date(timestamp),
+    across(c(
+      individual.local.identifier, age_CY, age_year,
+      country
+    ), as.factor)
+  )
+
+#str(TRACKS_HF_2026_ALT)
+TRACKS_HF_2026_ALT <- TRACKS_HF_2026_ALT %>%
+  mutate(
+    date = as.Date(date),
+    across(c(
+      individual.local.identifier, sex, age_CY, age_year, bird_day,
+      countries
+    ), as.factor)
+  )
+
+# str(data_sub5)
+data_sub5 <- data_sub5 %>%
+  mutate(
+    date = as.Date(timestamp),
+    across(c(
+      individual.local.identifier, age_CY, age_year,
+      country
+    ), as.factor)
+  )
+
+#str(DAYTABLE_2026)
+DAYTABLE_2026 <- DAYTABLE_2026 %>%
+  mutate(
+    date = as.Date(date),
+    across(c(
+      individual.local.identifier, sex, age_CY, age_year, bird_day,
+      countries
+    ), as.factor)
+  )
+#str(DAYTABLE_2026)
+```
+
+# Prétraitement
+
+### Délimitation des zones "Sahara"
+
+Zone_G = Zone saharienne délimitée par latitudes.
+
+Zone_interet = Zone saharienne délimitée par le biome saharien au Nord, et au Sud par la latitude du Géofence Sud.
+
+-   Ajout de la colonne Zone_D qui vaut TRUE si lat_mean est entre 17.51 et 28.749
+
+```{r}
+DAYTABLE_2026 <- DAYTABLE_2026 %>%
+  mutate(Zone_G = lat_mean >= 17.51 & lat_mean <= 28.749)
+TRACKS_HF_2026_SPEED <- TRACKS_HF_2026_SPEED %>%
+  mutate(Zone_G = location.lat >= 17.51 & location.lat <= 28.749)
+TRACKS_HF_2026_HEIGHT <- TRACKS_HF_2026_HEIGHT %>%
+  mutate(Zone_G = location.lat >= 17.51 & location.lat <= 28.749)
+TRACKS_HF_2026_ALT <- TRACKS_HF_2026_ALT %>%
+  mutate(Zone_G = lat_mean >= 17.51 & lat_mean <= 28.749)
+data_sub5 <- data_sub5 %>%
+  mutate(Zone_G = location.lat >= 17.51 & location.lat <= 28.749)
+DATA_HF <- DATA_HF %>%
+  mutate(Zone_G = location.lat >= 17.51 & location.lat <= 28.749)
+```
+
+-   Ajout de la colonne Zone_interet
+
+Création de la zone
+
+```{r}
+#| include: false
+library(sf)
+ecoregions <- st_read(here( "Alice/Data_analysis_June_2026/Ecoregions2017/Ecoregions2017.shp"), wkt_filter = st_as_text( st_as_sfc(st_bbox(c( xmin = -20, xmax = 60, ymin = 0, ymax = 40 ), crs = 4326)) ) ) 
+names(ecoregions) 
+#unique(ecoregions$BIOME_NAME)
+#unique(ecoregions$ECO_NAME)
+
+desert <- ecoregions[ecoregions$BIOME_NAME == "Deserts & Xeric Shrublands", ] 
+plot(desert["BIOME_NAME"])
+
+sahara <- ecoregions[grepl("Sahara", ecoregions$ECO_NAME), ] 
+plot(sahara["BIOME_NAME"])
+
+tibesti_sahara <- ecoregions[grepl("Sahara|Tibesti-Jebel Uweinat", ecoregions$ECO_NAME), ] 
+plot(tibesti_sahara["BIOME_NAME"])
+```
+
+sf de DAYTABLE_2026 et superposition du sf tibesti_sahara
+
+```{r}
+DAYTABLE_2026 <- DAYTABLE_2026[complete.cases(DAYTABLE_2026[,c("lon_mean","lat_mean")]),]
+pts_sf <- st_as_sf(DAYTABLE_2026, coords = c("lon_mean", "lat_mean"), crs = 4326)
+
+coords <- st_coordinates(pts_sf)
+# coords[,1] = longitude, coords[,2] = latitude
+lat <- coords[,2]
+intersects_vec <- apply(st_intersects(pts_sf, tibesti_sahara, sparse = FALSE), 1, any)
+
+pts_sf$Zone_interet <- ifelse(
+  (lat >= 17.51 & lat <= 26.0) | intersects_vec,
+  "Zone_interet",
+  NA
+)
+unique(pts_sf$Zone_interet)
+# Check
+tab <- table(pts_sf$Zone_interet, useNA = "ifany")
+# proportion
+prop <- tab / sum(tab) * 100
+prop # 17% de zone interet
+# Add Zone_interet to data
+DAYTABLE_2026$Zone_interet <- pts_sf$Zone_interet
+```
+
+sf de TRACKS_HF_2026_SPEED et TRACKS_HF_2026_HEIGHT et superposition du sf tibesti_sahara
+
+```{r}
+
+### sf de TRACKS_HF_2026_SPEED
+
+#OK, bottom :  latitude 17.51, bottom of the South Geofence
+pts_sf <- st_as_sf(TRACKS_HF_2026_SPEED, coords = c("location.long", "location.lat"), crs = 4326)
+
+coords <- st_coordinates(pts_sf)
+# coords[,1] = longitude, coords[,2] = latitude
+lat <- coords[,2]
+intersects_vec <- apply(st_intersects(pts_sf, tibesti_sahara, sparse = FALSE), 1, any)
+
+pts_sf$Zone_interet <- ifelse(
+  (lat >= 17.51 & lat <= 26.0) | intersects_vec,
+  "Zone_interet",
+  NA
+)
+unique(pts_sf$Zone_interet)
+# Check
+tab <- table(pts_sf$Zone_interet, useNA = "ifany")
+# proportion
+prop <- tab / sum(tab) * 100
+prop
+# Add Zone_interet to data
+TRACKS_HF_2026_SPEED$Zone_interet <- pts_sf$Zone_interet
+
+### sf de TRACKS_HF_2026_HEIGHT
+
+#OK, bottom :  latitude 17.51, bottom of the South Geofence
+pts_sf <- st_as_sf(TRACKS_HF_2026_HEIGHT, coords = c("location.long", "location.lat"), crs = 4326)
+
+coords <- st_coordinates(pts_sf)
+# coords[,1] = longitude, coords[,2] = latitude
+lat <- coords[,2]
+intersects_vec <- apply(st_intersects(pts_sf, tibesti_sahara, sparse = FALSE), 1, any)
+
+pts_sf$Zone_interet <- ifelse(
+  (lat >= 17.51 & lat <= 26.0) | intersects_vec,
+  "Zone_interet",
+  NA
+)
+unique(pts_sf$Zone_interet)
+# Check
+tab <- table(pts_sf$Zone_interet, useNA = "ifany")
+# proportion
+prop <- tab / sum(tab) * 100
+prop
+# Add Zone_interet to data
+TRACKS_HF_2026_HEIGHT$Zone_interet <- pts_sf$Zone_interet
+
+### sf de TRACKS_HF_2026_ALT
+
+#OK, bottom :  latitude 17.51, bottom of the South Geofence
+pts_sf <- st_as_sf(TRACKS_HF_2026_ALT, coords = c("lon_mean", "lat_mean"), crs = 4326)
+
+coords <- st_coordinates(pts_sf)
+# coords[,1] = longitude, coords[,2] = latitude
+lat <- coords[,2]
+intersects_vec <- apply(st_intersects(pts_sf, tibesti_sahara, sparse = FALSE), 1, any)
+
+pts_sf$Zone_interet <- ifelse(
+  (lat >= 17.51 & lat <= 26.0) | intersects_vec,
+  "Zone_interet",
+  NA
+)
+# Check
+tab <- table(pts_sf$Zone_interet, useNA = "ifany")
+# proportion
+prop <- tab / sum(tab) * 100
+prop
+# Add Zone_interet to data
+TRACKS_HF_2026_ALT$Zone_interet <- pts_sf$Zone_interet
+```
+
+sf de data_sub5 et superposition du sf tibesti_sahara
+
+```{r}
+pts_sf <- st_as_sf(data_sub5, coords = c("location.long", "location.lat"), crs = 4326)
+
+coords <- st_coordinates(pts_sf)
+# coords[,1] = longitude, coords[,2] = latitude
+lat <- coords[,2]
+intersects_vec <- apply(st_intersects(pts_sf, tibesti_sahara, sparse = FALSE), 1, any)
+
+pts_sf$Zone_interet <- ifelse(
+  (lat >= 17.51 & lat <= 26.0) | intersects_vec,
+  "Zone_interet",
+  NA
+)
+# Check
+tab <- table(pts_sf$Zone_interet, useNA = "ifany")
+# proportion
+prop <- tab / sum(tab) * 100
+prop
+# Add Zone_interet to data
+data_sub5$Zone_interet <- pts_sf$Zone_interet
+```
+
+sf de DATA_HF et superposition du sf tibesti_sahara
+
+```{r}
+pts_sf <- st_as_sf(DATA_HF, coords = c("location.long", "location.lat"), crs = 4326)
+
+coords <- st_coordinates(pts_sf)
+# coords[,1] = longitude, coords[,2] = latitude
+lat <- coords[,2]
+intersects_vec <- apply(st_intersects(pts_sf, tibesti_sahara, sparse = FALSE), 1, any)
+
+pts_sf$Zone_interet <- ifelse(
+  (lat >= 17.51 & lat <= 26.0) | intersects_vec,
+  "Zone_interet",
+  NA
+)
+# Check
+tab <- table(pts_sf$Zone_interet, useNA = "ifany")
+# proportion
+prop <- tab / sum(tab) * 100
+prop
+# Add Zone_interet to data
+DATA_HF$Zone_interet <- pts_sf$Zone_interet
+```
+
+### Ajout de l'année à partir de la date
+
+```{r}
+TRACKS_HF_2026_SPEED <- TRACKS_HF_2026_SPEED %>%
+  mutate(year = year(as.Date(date)))
+
+TRACKS_HF_2026_HEIGHT <- TRACKS_HF_2026_HEIGHT %>%
+  mutate(year = year(as.Date(date)))
+
+TRACKS_HF_2026_ALT <- TRACKS_HF_2026_ALT %>%
+  mutate(year = year(as.Date(date)))
+
+data_sub5 <- data_sub5 %>%
+  mutate(year = year(as.Date(date)))
+
+DAYTABLE_2026 <- DAYTABLE_2026 %>%
+  mutate(year = year(as.Date(date)))
+
+DATA_HF$date <- as.Date(DATA_HF$timestamp)
+DATA_HF <- DATA_HF %>%
+  mutate(year = year(as.Date(date)))
+```
+
+### Ajout de la saison basé sur la date
+
+```{r}
+# ADD column "MIGRATION" spring / autumn in the 3 datasets DAYTABLE_2026 et TRACKS_HF_2026
+DAYTABLE_2026$date <- as.Date(DAYTABLE_2026$date)
+TRACKS_HF_2026_SPEED$date <- as.Date(TRACKS_HF_2026_SPEED$date)
+TRACKS_HF_2026_HEIGHT$date <- as.Date(TRACKS_HF_2026_HEIGHT$date)
+data_sub5$date <- as.Date(data_sub5$date)
+TRACKS_HF_2026_ALT$date <- as.Date(TRACKS_HF_2026_ALT$date)
+DATA_HF$date <- as.Date(DATA_HF$date)
+
+DAYTABLE_2026 <- DAYTABLE_2026 %>%
+  mutate(
+    MIGRATION = case_when(
+      month(date) %in% 1:7  ~ "spring",
+      month(date) %in% 8:12 ~ "autumn",
+      TRUE ~ NA_character_
+    )
+  )
+TRACKS_HF_2026_SPEED <- TRACKS_HF_2026_SPEED %>%
+  mutate(
+    MIGRATION = case_when(
+      month(date) %in% 1:7  ~ "spring",
+      month(date) %in% 8:12 ~ "autumn",
+      TRUE ~ NA_character_
+    )
+  )
+
+TRACKS_HF_2026_HEIGHT <- TRACKS_HF_2026_HEIGHT %>%
+  mutate(
+    MIGRATION = case_when(
+      month(date) %in% 1:7  ~ "spring",
+      month(date) %in% 8:12 ~ "autumn",
+      TRUE ~ NA_character_
+    )
+  )
+
+TRACKS_HF_2026_ALT <- TRACKS_HF_2026_ALT %>%
+  mutate(
+    MIGRATION = case_when(
+      month(date) %in% 1:7  ~ "spring",
+      month(date) %in% 8:12 ~ "autumn",
+      TRUE ~ NA_character_
+    )
+  )
+
+data_sub5 <- data_sub5 %>%
+  mutate(
+    MIGRATION = case_when(
+      month(date) %in% 1:7  ~ "spring",
+      month(date) %in% 8:12 ~ "autumn",
+      TRUE ~ NA_character_
+    )
+  )
+
+DATA_HF <- DATA_HF %>%
+  mutate(
+    MIGRATION = case_when(
+      month(date) %in% 1:7  ~ "spring",
+      month(date) %in% 8:12 ~ "autumn",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+=\> Une majorité des jours et des blocks de HF sont sur le géofence 5 avec 316 blocks de hautes fréquences et 60 jours sur le géofence (entre 31.271 et de 32.232 de latitude)
+
+### Variable "age" simplifiée en juvéniles/adultes
+
+```{r}
+#CréATION variable age simplifiée (age_CY : "adult" ou numéros = juveniles)
+
+# DAYTABLE_2026
+DAYTABLE_2026 <- DAYTABLE_2026 %>%
+  mutate(
+    age_group = case_when(
+      age_CY == "adult" ~ "adult",
+      !is.na(age_CY) & age_CY != "adult" ~ "juvenile",
+      TRUE ~ NA_character_
+    )
+  )
+table(DAYTABLE_2026$age_group, useNA = "ifany") 
+
+# TRACKS_HF_2026
+
+# SPEED
+TRACKS_HF_2026_SPEED <- TRACKS_HF_2026_SPEED %>%
+  mutate(
+    age_group = case_when(
+      age_CY == "adult" ~ "adult",
+      !is.na(age_CY) & age_CY != "adult" ~ "juvenile",
+      TRUE ~ NA_character_
+    )
+  )
+table(TRACKS_HF_2026_SPEED$age_group, useNA = "ifany")
+
+# HEIGHT
+TRACKS_HF_2026_HEIGHT <- TRACKS_HF_2026_HEIGHT %>%
+  mutate(
+    age_group = case_when(
+      age_CY == "adult" ~ "adult",
+      !is.na(age_CY) & age_CY != "adult" ~ "juvenile",
+      TRUE ~ NA_character_
+    )
+  )
+table(TRACKS_HF_2026_HEIGHT$age_group, useNA = "ifany")
+
+# ALT
+TRACKS_HF_2026_ALT <- TRACKS_HF_2026_ALT %>%
+  mutate(
+    age_group = case_when(
+      age_CY == "adult" ~ "adult",
+      !is.na(age_CY) & age_CY != "adult" ~ "juvenile",
+      TRUE ~ NA_character_
+    )
+  )
+table(TRACKS_HF_2026_ALT$age_group, useNA = "ifany")
+
+# data_sub5
+data_sub5 <- data_sub5 %>%
+  mutate(
+    age_group = case_when(
+      age_CY == "adult" ~ "adult",
+      !is.na(age_CY) & age_CY != "adult" ~ "juvenile",
+      TRUE ~ NA_character_
+    )
+  )
+table(data_sub5$age_group, useNA = "ifany")
+
+# DATA_HF
+DATA_HF <- DATA_HF %>%
+  mutate(
+    age_group = case_when(
+      age_CY == "adult" ~ "adult",
+      !is.na(age_CY) & age_CY != "adult" ~ "juvenile",
+      TRUE ~ NA_character_
+    )
+  )
+table(DATA_HF$age_group, useNA = "ifany")
+
+```
+
+Le ratio n'est pas le même, beaucoup plus de tracks de HF pour les juvéniles que pour les adultes alors qu'il y a un ratio de seulement X entre le nombre de jours d'adultes et de juvéniles. (probablement à cause de Tibordure du Chilloux qui a de la HF au sud du Mali et au Burkina Faso)
+
+### Ajouter ID = noms courts
+
+```{r}
+# Ajoute colonne ID simplifiée
+DAYTABLE_2026 <- DAYTABLE_2026 %>%
+  mutate(ID = if_else(
+    word(individual.local.identifier, 1) == "La",
+    word(individual.local.identifier, 2),
+    word(individual.local.identifier, 1)
+  )) %>%
+  mutate(ID = sub("-.*", "", ID))
+TRACKS_HF_2026_SPEED <- TRACKS_HF_2026_SPEED %>%
+  mutate(ID = if_else(
+    word(individual.local.identifier, 1) == "La",
+    word(individual.local.identifier, 2),
+    word(individual.local.identifier, 1)
+  )) %>%
+  mutate(ID = sub("-.*", "", ID))
+unique(TRACKS_HF_2026_SPEED$ID)
+TRACKS_HF_2026_HEIGHT <- TRACKS_HF_2026_HEIGHT %>%
+  mutate(ID = if_else(
+    word(individual.local.identifier, 1) == "La",
+    word(individual.local.identifier, 2),
+    word(individual.local.identifier, 1)
+  )) %>%
+  mutate(ID = sub("-.*", "", ID))
+unique(TRACKS_HF_2026_HEIGHT$ID)
+TRACKS_HF_2026_ALT <- TRACKS_HF_2026_ALT %>%
+  mutate(ID = if_else(
+    word(individual.local.identifier, 1) == "La",
+    word(individual.local.identifier, 2),
+    word(individual.local.identifier, 1)
+  )) %>%
+  mutate(ID = sub("-.*", "", ID))
+unique(TRACKS_HF_2026_ALT$ID)
+data_sub5 <- data_sub5 %>%
+  mutate(ID = if_else(
+    word(individual.local.identifier, 1) == "La",
+    word(individual.local.identifier, 2),
+    word(individual.local.identifier, 1)
+  )) %>%
+  mutate(ID = sub("-.*", "", ID))
+unique(data_sub5$ID)
+DATA_HF <- DATA_HF %>%
+  mutate(ID = if_else(
+    word(individual.local.identifier, 1) == "La",
+    word(individual.local.identifier, 2),
+    word(individual.local.identifier, 1)
+  )) %>%
+  mutate(ID = sub("-.*", "", ID))
+unique(DATA_HF$ID)
+```
+
+### Suncalc
+
+```{r}
+
+# ALT
+TRACKS_HF_2026_ALT <- TRACKS_HF_2026_ALT %>%
+  mutate(date = as.Date(timestamp_start))
+TRACKS_HF_2026_ALT <- TRACKS_HF_2026_ALT %>%
+ mutate(
+    lat = first_lat,
+    lon = first_lon,
+    Date=date
+  )
+sun_times <- getSunlightTimes(
+  data = TRACKS_HF_2026_ALT,
+  keep = c("sunrise"),
+  tz = "UTC"
+)
+TRACKS_HF_2026_ALT <- bind_cols(
+  TRACKS_HF_2026_ALT,
+  sunrise = sun_times$sunrise
+)
+
+# Conversion 
+TRACKS_HF_2026_ALT <- TRACKS_HF_2026_ALT %>%
+  mutate(
+    timestamp_start = as.POSIXct(timestamp_start, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+    timestamp_end   = as.POSIXct(timestamp_end,   format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+  )
+
+# Calcul du temps depuis le lever du soleil
+TRACKS_HF_2026_ALT <- TRACKS_HF_2026_ALT %>%
+  mutate(
+    timestamp_moyen = timestamp_start + (timestamp_end - timestamp_start)/2,
+    temps_depuis_sunrise = as.numeric(difftime(timestamp_moyen, sunrise, units = "hours"))
+  )
+
+
+# SPEED
+TRACKS_HF_2026_SPEED <- TRACKS_HF_2026_SPEED %>%
+  mutate(
+    lat = location.lat,
+    lon = location.long,
+    timestamp = as.POSIXct(timestamp, tz = "UTC"),
+    date = as.Date(timestamp)
+  )
+sun_input_speed <- TRACKS_HF_2026_SPEED %>%
+  group_by(date) %>%
+  summarise(
+    lat = mean(lat, na.rm = TRUE),
+    lon = mean(lon, na.rm = TRUE),
+    .groups = "drop"
+  )
+sun_times_speed <- getSunlightTimes(
+  data = sun_input_speed,
+  keep = "sunrise",
+  tz = "UTC"
+)
+TRACKS_HF_2026_SPEED <- TRACKS_HF_2026_SPEED %>%
+  left_join(sun_times_speed, by = "date")
+
+
+names(TRACKS_HF_2026_SPEED) # sunrise.y
+
+TRACKS_HF_2026_SPEED <- TRACKS_HF_2026_SPEED %>%
+  mutate(
+    temps_depuis_sunrise = as.numeric(difftime(timestamp, sunrise.y, units = "hours"))
+  )
+head(TRACKS_HF_2026_SPEED$temps_depuis_sunrise)
+
+
+# HEIGHT
+TRACKS_HF_2026_HEIGHT <- TRACKS_HF_2026_HEIGHT %>%
+  mutate(
+    lat = location.lat,
+    lon = location.long,
+    timestamp = as.POSIXct(timestamp, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+    date = as.Date(timestamp)
+  )
+
+sun_input_height <- TRACKS_HF_2026_HEIGHT %>%
+  group_by(date) %>%
+  summarise(
+    lat = mean(lat, na.rm = TRUE),
+    lon = mean(lon, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+sun_times_height <- getSunlightTimes(
+  data = sun_input_height,
+  keep = "sunrise",
+  tz = "UTC"
+) %>%
+  distinct(date, .keep_all = TRUE)
+
+TRACKS_HF_2026_HEIGHT <- TRACKS_HF_2026_HEIGHT %>%
+  left_join(sun_times_height, by = "date")
+
+
+names(TRACKS_HF_2026_HEIGHT) # sunrise.y
+
+TRACKS_HF_2026_HEIGHT <- TRACKS_HF_2026_HEIGHT %>%
+  mutate(
+    temps_depuis_sunrise = as.numeric(difftime(timestamp, sunrise.y, units = "hours"))
+  )
+head(TRACKS_HF_2026_HEIGHT$temps_depuis_sunrise)
+
+# data_sub5
+data_sub5 <- data_sub5 %>%
+  mutate(
+    lat = location.lat,
+    lon = location.long,
+    timestamp = as.POSIXct(timestamp, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+    date = as.Date(timestamp)
+  )
+
+sun_input_sub5 <- data_sub5 %>%
+  group_by(date) %>%
+  summarise(
+    lat = mean(lat, na.rm = TRUE),
+    lon = mean(lon, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+sun_times_sub5 <- getSunlightTimes(
+  data = sun_input_sub5,
+  keep = "sunrise",
+  tz = "UTC"
+) %>%
+  distinct(date, .keep_all = TRUE)
+
+data_sub5 <- data_sub5 %>%
+  left_join(sun_times_sub5, by = "date")
+
+
+names(data_sub5) # sunrise.y
+
+data_sub5 <- data_sub5 %>%
+  mutate(
+    temps_depuis_sunrise = as.numeric(difftime(timestamp, sunrise.y, units = "hours")) # Rq : Les positions GPS originelles sont lat.x et lon.x
+  )
+head(data_sub5$temps_depuis_sunrise)
+
+
+```
+
+### Formats
+
+```{r}
+# Formats
+TRACKS_HF_2026_SPEED <- TRACKS_HF_2026_SPEED %>%
+  mutate(across(c(
+    Zone_interet, age_group, ID, MIGRATION
+  ), as.factor))
+TRACKS_HF_2026_HEIGHT <- TRACKS_HF_2026_HEIGHT %>%
+  mutate(across(c(
+    Zone_interet, age_group, ID, MIGRATION
+  ), as.factor))
+TRACKS_HF_2026_ALT <- TRACKS_HF_2026_ALT %>%
+  mutate(across(c(
+    Zone_interet, age_group, ID, MIGRATION
+  ), as.factor))
+data_sub5 <- data_sub5 %>%
+  mutate(across(c(
+    Zone_interet, age_group, ID, MIGRATION
+  ), as.factor))
+DAYTABLE_2026 <- DAYTABLE_2026 %>%
+  mutate(across(c(
+    Zone_interet, age_group, ID, MIGRATION
+  ), as.factor))
+DATA_HF <- DATA_HF %>%
+  mutate(across(c(
+    Zone_interet, age_group, ID, MIGRATION
+  ), as.factor))
+```
+
+### Gestion des anomalies
+
+```{r}
+# TRACKS_HF_2026_SPEED
+
+# Charline et Mina
+# Charline
+start_time <- as.POSIXct("2025-05-10 13:00:00", tz = "UTC")
+end_time   <- as.POSIXct("2025-09-24 10:00:00", tz = "UTC")
+TRACKS_HF_2026_SPEED <- TRACKS_HF_2026_SPEED[
+  !(
+    TRACKS_HF_2026_SPEED$timestamp >= start_time &
+    TRACKS_HF_2026_SPEED$timestamp <= end_time &
+    TRACKS_HF_2026_SPEED$individual.local.identifier == "Charline de la Grisonnière"
+  ),
+]
+# Mina
+TRACKS_HF_2026_SPEED <- TRACKS_HF_2026_SPEED[
+  !(
+    TRACKS_HF_2026_SPEED$country == "Tunisia" &
+    TRACKS_HF_2026_SPEED$individual.local.identifier == "Mina de Rians"
+  ),
+]
+# Major
+TRACKS_HF_2026_SPEED <- TRACKS_HF_2026_SPEED[
+  !(
+    TRACKS_HF_2026_SPEED$year == "2023" &
+    TRACKS_HF_2026_SPEED$MIGRATION == "spring" &
+    TRACKS_HF_2026_SPEED$individual.local.identifier == "Major de Rians"
+  ),
+]
+
+# TRACKS_HF_2026_HEIGHT
+
+# Charline et Mina
+# Charline
+start_time <- as.POSIXct("2025-05-10 13:00:00", tz = "UTC")
+end_time   <- as.POSIXct("2025-09-24 10:00:00", tz = "UTC")
+TRACKS_HF_2026_HEIGHT <- TRACKS_HF_2026_HEIGHT[
+  !(
+    TRACKS_HF_2026_HEIGHT$timestamp >= start_time &
+    TRACKS_HF_2026_HEIGHT$timestamp <= end_time &
+    TRACKS_HF_2026_HEIGHT$individual.local.identifier == "Charline de la Grisonnière"
+  ),
+]
+# Mina
+TRACKS_HF_2026_HEIGHT <- TRACKS_HF_2026_HEIGHT[
+  !(
+    TRACKS_HF_2026_HEIGHT$country == "Tunisia" &
+    TRACKS_HF_2026_HEIGHT$individual.local.identifier == "Mina de Rians"
+  ),
+]
+# Major
+TRACKS_HF_2026_HEIGHT <- TRACKS_HF_2026_HEIGHT[
+  !(
+    TRACKS_HF_2026_HEIGHT$year == "2023" &
+    TRACKS_HF_2026_HEIGHT$MIGRATION == "spring" &
+    TRACKS_HF_2026_HEIGHT$individual.local.identifier == "Major de Rians"
+  ),
+]
+
+# TRACKS_HF_2026_ALT
+# Charline et Mina
+# Charline
+start_time <- as.POSIXct("2025-05-10 13:00:00", tz = "UTC")
+end_time   <- as.POSIXct("2025-09-24 10:00:00", tz = "UTC")
+TRACKS_HF_2026_ALT <- TRACKS_HF_2026_ALT[
+  !(
+    TRACKS_HF_2026_ALT$timestamp_start >= start_time &
+    TRACKS_HF_2026_ALT$timestamp_end <= end_time &
+    TRACKS_HF_2026_ALT$individual.local.identifier == "Charline de la Grisonnière"
+  ),
+]
+# Mina
+TRACKS_HF_2026_ALT <- TRACKS_HF_2026_ALT[
+  !(
+    TRACKS_HF_2026_ALT$countries == "Tunisia" &
+    TRACKS_HF_2026_ALT$individual.local.identifier == "Mina de Rians"
+  ),
+]
+# Major
+TRACKS_HF_2026_ALT <- TRACKS_HF_2026_ALT[
+  !(
+    TRACKS_HF_2026_ALT$year == "2023" &
+    TRACKS_HF_2026_ALT$MIGRATION == "spring" &
+    TRACKS_HF_2026_ALT$individual.local.identifier == "Major de Rians"
+  ),
+]
+
+# data_sub5
+
+# Charline et Mina
+# Charline
+start_time <- as.POSIXct("2025-05-10 13:00:00", tz = "UTC")
+end_time   <- as.POSIXct("2025-09-24 10:00:00", tz = "UTC")
+data_sub5 <- data_sub5[
+  !(
+    data_sub5$timestamp >= start_time &
+    data_sub5$timestamp <= end_time &
+    data_sub5$individual.local.identifier == "Charline de la Grisonnière"
+  ),
+]
+# Mina
+data_sub5 <- data_sub5[
+  !(
+    data_sub5$country == "Tunisia" &
+    data_sub5$individual.local.identifier == "Mina de Rians"
+  ),
+]
+# Major
+data_sub5 <- data_sub5[
+  !(
+    data_sub5$year == "2023" &
+    data_sub5$MIGRATION == "spring" &
+    data_sub5$individual.local.identifier == "Major de Rians"
+  ),
+]
+
+# DATA_HF
+# Charline et Mina
+# Charline
+start_time <- as.POSIXct("2025-05-10 13:00:00", tz = "UTC")
+end_time   <- as.POSIXct("2025-09-24 10:00:00", tz = "UTC")
+DATA_HF <- DATA_HF[
+  !(
+    DATA_HF$timestamp >= start_time &
+    DATA_HF$timestamp <= end_time &
+    DATA_HF$individual.local.identifier == "Charline de la Grisonnière"
+  ),
+]
+# Mina
+DATA_HF <- DATA_HF[
+  !(
+    DATA_HF$country == "Tunisia" &
+    DATA_HF$individual.local.identifier == "Mina de Rians"
+  ),
+]
+# Major
+DATA_HF <- DATA_HF[
+  !(
+    DATA_HF$year == "2023" &
+    DATA_HF$MIGRATION == "spring" &
+    DATA_HF$individual.local.identifier == "Major de Rians"
+  ),
+]
+
+
+# DAYTABLE_2026
+# Charline et Mina
+# Charline
+start_time <- as.Date("2025-05-10")
+end_time   <- as.Date("2025-09-24")
+DAYTABLE_2026 <- DAYTABLE_2026[
+  !(
+    DAYTABLE_2026$date >= start_time &
+    DAYTABLE_2026$date <= end_time &
+    DAYTABLE_2026$individual.local.identifier == "Charline de la Grisonnière"
+  ),
+]
+# Mina
+DAYTABLE_2026 <- DAYTABLE_2026[
+  !(
+    DAYTABLE_2026$countries == "Tunisia" &
+    DAYTABLE_2026$individual.local.identifier == "Mina de Rians"
+  ),
+]
+# Major
+DAYTABLE_2026 <- DAYTABLE_2026[
+  !(
+    DAYTABLE_2026$year == "2023" &
+    DAYTABLE_2026$MIGRATION == "spring" &
+    DAYTABLE_2026$individual.local.identifier == "Major de Rians"
+  ),
+]
+
+
+# Abel de la Trejasse, Chantal 2.0, La Barben de Sufferchoix
+
+
+```
+
+### move
+
+```{r}
+# Garder que les lignes où move_2 = move ou dans le cas de TRACKS_HF_2026_ALT garder que les lignes dont prop_move > 0.5
+
+# TRACKS_HF_2026_SPEED
+# move_2
+TRACKS_HF_2026_SPEED <- TRACKS_HF_2026_SPEED %>%
+  dplyr::filter(move_2 == "move")
+
+# TRACKS_HF_2026_HEIGHT
+# move_2
+TRACKS_HF_2026_HEIGHT <- TRACKS_HF_2026_HEIGHT %>%
+  dplyr::filter(move_2 == "move")
+
+# TRACKS_HF_2026_ALT
+# str(TRACKS_HF_2026_ALT) # prop_move > 0.5
+TRACKS_HF_2026_ALT <- TRACKS_HF_2026_ALT %>%
+  dplyr::filter(prop_move > 0.7)
+
+# data_sub5
+# move_2
+data_sub5 <- data_sub5 %>%
+  dplyr::filter(move_2 == "move")
+
+# DATA_HF
+# move_2
+DATA_HF <- DATA_HF %>%
+  dplyr::filter(move_2 == "move")
+```
+
+### Jeux de données séparés
+
+```{r}
+conflicts_prefer(dplyr::filter)
+
+## DAYTABLE
+
+# JDD séparé entre spring et autumn
+DAYTABLE_2026_spring <- DAYTABLE_2026 %>%
+  filter(MIGRATION == "spring")
+DAYTABLE_2026_autumn <- DAYTABLE_2026 %>%
+  filter(MIGRATION == "autumn")
+# Sélection des lignes où Zone_G est TRUE
+DAYTABLE_2026_G <- DAYTABLE_2026 %>%
+  filter(Zone_G == TRUE)
+DAYTABLE_2026_spring_G <- DAYTABLE_2026_spring %>%
+  filter(Zone_G == TRUE)
+DAYTABLE_2026_autumn_G <- DAYTABLE_2026_autumn %>%
+  filter(Zone_G == TRUE)
+# Séléction de la zone_interet uniquement
+DAYTABLE_2026_Z <- DAYTABLE_2026 %>%
+  filter(!is.na(Zone_interet))
+DAYTABLE_2026_spring_Z <- DAYTABLE_2026_spring %>%
+  filter(!is.na(Zone_interet))
+DAYTABLE_2026_autumn_Z <- DAYTABLE_2026_autumn %>%
+  filter(!is.na(Zone_interet))
+
+## TRACKS 
+
+# SPEED
+# JDD séparé entre spring et autumn
+TRACKS_HF_2026_SPEED_spring <- subset(TRACKS_HF_2026_SPEED, MIGRATION == "spring")
+TRACKS_HF_2026_SPEED_autumn <- subset(TRACKS_HF_2026_SPEED, MIGRATION == "autumn")
+# Sélection des lignes où Zone_G est TRUE
+TRACKS_HF_2026_SPEED_G <- TRACKS_HF_2026_SPEED %>%
+  filter(Zone_G == TRUE)
+TRACKS_HF_2026_SPEED_spring_G <- TRACKS_HF_2026_SPEED_spring %>%
+  filter(Zone_G == TRUE)
+TRACKS_HF_2026_SPEED_autumn_G <- TRACKS_HF_2026_SPEED_autumn %>%
+  filter(Zone_G == TRUE)
+# Séléction de la zone_interet uniquement
+TRACKS_HF_2026_SPEED_Z <- TRACKS_HF_2026_SPEED %>%
+  filter(!is.na(Zone_interet))
+TRACKS_HF_2026_SPEED_spring_Z <- TRACKS_HF_2026_SPEED_spring %>%
+  filter(!is.na(Zone_interet))
+TRACKS_HF_2026_SPEED_autumn_Z <- TRACKS_HF_2026_SPEED_autumn %>%
+  filter(!is.na(Zone_interet))
+
+# HEIGHT
+# JDD séparé entre spring et autumn
+TRACKS_HF_2026_HEIGHT_spring <- subset(TRACKS_HF_2026_HEIGHT, MIGRATION == "spring")
+TRACKS_HF_2026_HEIGHT_autumn <- subset(TRACKS_HF_2026_HEIGHT, MIGRATION == "autumn")
+# Sélection des lignes où Zone_G est TRUE
+TRACKS_HF_2026_HEIGHT_G <- TRACKS_HF_2026_HEIGHT %>%
+  filter(Zone_G == TRUE)
+TRACKS_HF_2026_HEIGHT_spring_G <- TRACKS_HF_2026_HEIGHT_spring %>%
+  filter(Zone_G == TRUE)
+TRACKS_HF_2026_HEIGHT_autumn_G <- TRACKS_HF_2026_HEIGHT_autumn %>%
+  filter(Zone_G == TRUE)
+# Séléction de la zone_interet uniquement
+TRACKS_HF_2026_HEIGHT_Z <- TRACKS_HF_2026_HEIGHT %>%
+  filter(!is.na(Zone_interet))
+TRACKS_HF_2026_HEIGHT_spring_Z <- TRACKS_HF_2026_HEIGHT_spring %>%
+  filter(!is.na(Zone_interet))
+TRACKS_HF_2026_HEIGHT_autumn_Z <- TRACKS_HF_2026_HEIGHT_autumn %>%
+  filter(!is.na(Zone_interet))
+
+# ALT
+# JDD séparé entre spring et autumn
+TRACKS_HF_2026_ALT_spring <- subset(TRACKS_HF_2026_ALT, MIGRATION == "spring")
+TRACKS_HF_2026_ALT_autumn <- subset(TRACKS_HF_2026_ALT, MIGRATION == "autumn")
+# Sélection des lignes où Zone_G est TRUE
+TRACKS_HF_2026_ALT_G <- TRACKS_HF_2026_ALT %>%
+  filter(Zone_G == TRUE)
+TRACKS_HF_2026_ALT_spring_G <- TRACKS_HF_2026_ALT_spring %>%
+  filter(Zone_G == TRUE)
+TRACKS_HF_2026_ALT_autumn_G <- TRACKS_HF_2026_ALT_autumn %>%
+  filter(Zone_G == TRUE)
+# Séléction de la zone_interet uniquement
+TRACKS_HF_2026_ALT_Z <- TRACKS_HF_2026_ALT %>%
+  filter(!is.na(Zone_interet))
+TRACKS_HF_2026_ALT_spring_Z <- TRACKS_HF_2026_ALT_spring %>%
+  filter(!is.na(Zone_interet))
+TRACKS_HF_2026_ALT_autumn_Z <- TRACKS_HF_2026_ALT_autumn %>%
+  filter(!is.na(Zone_interet))
+
+# data_sub5
+# JDD séparé entre spring et autumn
+data_sub5_spring <- subset(data_sub5, MIGRATION == "spring")
+data_sub5_autumn <- subset(data_sub5, MIGRATION == "autumn")
+# Sélection des lignes où Zone_G est TRUE
+data_sub5_G <- data_sub5 %>%
+  filter(Zone_G == TRUE)
+data_sub5_spring_G <- data_sub5_spring %>%
+  filter(Zone_G == TRUE)
+data_sub5_autumn_G <- data_sub5_autumn %>%
+  filter(Zone_G == TRUE)
+# Séléction de la zone_interet uniquement
+data_sub5_Z <- data_sub5 %>%
+  filter(!is.na(Zone_interet))
+data_sub5_spring_Z <- data_sub5_spring %>%
+  filter(!is.na(Zone_interet))
+data_sub5_autumn_Z <- data_sub5_autumn %>%
+  filter(!is.na(Zone_interet))
+
+# DATA_HF
+# JDD séparé entre spring et autumn
+DATA_HF_spring <- DATA_HF %>%
+  filter(MIGRATION == "spring")
+DATA_HF_autumn <- DATA_HF %>%
+  filter(MIGRATION == "autumn")
+# Sélection des lignes où Zone_G est TRUE
+DATA_HF_G <- DATA_HF %>%
+  filter(Zone_G == TRUE)
+DATA_HF_spring_G <- DATA_HF_spring %>%
+  filter(Zone_G == TRUE)
+DATA_HF_autumn_G <- DATA_HF_autumn %>%
+  filter(Zone_G == TRUE)
+# Séléction de la zone_interet uniquement
+DATA_HF_Z <- DATA_HF %>%
+  filter(!is.na(Zone_interet))
+DATA_HF_spring_Z <- DATA_HF_spring %>%
+  filter(!is.na(Zone_interet))
+DATA_HF_autumn_Z <- DATA_HF_autumn %>%
+  filter(!is.na(Zone_interet))
+```
+
+# N généraux
+
+```{r}
+summary(data)
+table(data$individual.local.identifier)
+summary(data_sub5_Z)
+table(data_sub5_Z$individual.local.identifier)
+summary(DATA_HF_Z)
+table(DATA_HF_Z$individual.local.identifier)
+summary(DATA_HF_autumn_Z)
+summary(DATA_HF_spring_Z)
+```
+
+# I. Echelle SAHARA
+
+## Distances traversée zone_G
+
+### Calcul distances de traversée par saison
+
+```{r}
+# Spring
+distances_spring <- data_sub5_spring_G %>%
+  arrange(ID, timestamp) %>%
+  mutate(
+    year = year(timestamp),
+    lon_next = lead(lon.x),
+    lat_next = lead(lat.x),
+    id_next = lead(ID),
+    year_next = lead(year),
+    
+    dist = ifelse(
+      ID == id_next & year == year_next,
+      distHaversine(cbind(lon.x, lat.x), cbind(lon_next, lat_next)),
+      NA
+    )
+  ) %>%
+  group_by(ID, year, age_group) %>%
+  summarise(
+    dist_km = sum(dist, na.rm = TRUE) / 1000,
+    .groups = "drop"
+  )
+distances_spring
+
+# Autumn
+distances_autumn <- data_sub5_autumn_G %>%
+  arrange(ID, timestamp) %>%
+  mutate(
+    year = year(timestamp),
+    lon_next = lead(lon.x),
+    lat_next = lead(lat.x),
+    id_next = lead(ID),
+    year_next = lead(year),
+    
+    dist = ifelse(
+      ID == id_next & year == year_next,
+      distHaversine(cbind(lon.x, lat.x), cbind(lon_next, lat_next)),
+      NA
+    )
+  ) %>%
+  group_by(ID, year, age_group) %>%
+  summarise(
+    dist_km = sum(dist, na.rm = TRUE) / 1000,
+    .groups = "drop"
+  )
+distances_autumn
+```
+
+### Représentation dist par individu
+
+```{r}
+# Représentation dist_annuelle en fonction des individus (spring et autumn séparé)
+ggplot(distances_spring,
+       aes(x = ID,
+           y = dist_km)) +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_text(aes(label = year),
+            vjust = -0.5, size = 3) +
+  labs(
+    x = "Individuals",
+    y = "Distance (km)",
+    title = "Crossing Distance by ID - Spring"
+  ) +
+  theme_minimal()
+
+ggplot(distances_autumn,
+       aes(x = ID,
+           y = dist_km)) +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_text(aes(label = year),
+            vjust = -0.5, size = 3) +
+  labs(
+    x = "Individuals",
+    y = "Distance (km)",
+    title = "Crossing Distance by ID - Autumn"
+  ) +
+  theme_minimal()
+```
+
+Mina de Rians 2025? -\> Les données n'étaient pas encore chargées en fevrier 2026 sur Ornitela. A voir ce qui pourra être ok au prochain téléchargement de données 2026 pour décider du tri.
+
+### Représentation par age_group et test
+
+```{r}
+conflicts_prefer(lmerTest::lmer)
+
+# Regroupement
+distances_all <- bind_rows(
+  distances_spring %>% mutate(season = "spring"),
+  distances_autumn %>% mutate(season = "autumn")
+)
+distances_all$age_group <- as.factor (distances_all$age_group)
+
+# lme
+lme_dist1 <- lmer(dist_km ~ age_group + season + (1|ID), data = distances_all)
+summary(lme_dist1)
+lme_dist2 <- lmer(dist_km ~ age_group + season + age_group : season + (1|ID), data = distances_all)
+summary(lme_dist2)
+
+AIC (lme_dist1, lme_dist2) # lme_dist2
+
+# Représentation
+library(ggeffects)
+library(ggplot2)
+library(ggsignif)
+
+# Grille de prédiction avec IC
+pred <- ggpredict(lme_dist2, terms = c("season", "age_group"))
+
+# Renommer pour clarté
+new_data <- as.data.frame(pred)
+colnames(new_data)[colnames(new_data) == "x"]     <- "season"
+colnames(new_data)[colnames(new_data) == "group"] <- "age_group"
+
+# Représentation
+
+#####
+library(stringr)
+
+new_data$season_num <- ifelse(new_data$season == "autumn", 0, 0.22)
+distances_all$season_num <- ifelse(distances_all$season == "autumn", 0, 0.22)
+
+ggplot(new_data, aes(x = season_num, y = predicted,
+                     fill = age_group, group = age_group)) +
+  geom_col(position = position_dodge(0.16),
+           width = 0.16,
+           alpha = 0.7,
+           color = "black") +
+  geom_jitter(data = distances_all,
+              aes(x = season_num, y = dist_km, color = age_group),
+              position = position_jitterdodge(jitter.width = 0.025, dodge.width = 0.16),
+              alpha = 0.8, size = 1.8, inherit.aes = FALSE) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.045, linewidth = 0.7,
+                position = position_dodge(0.16)) +
+  scale_fill_manual(values = c("adult" = "#00B074", "juvenile" = "#FF9F1C"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_color_manual(values = c("adult" = "#00693F", "juvenile" = "#C96A00"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_x_continuous(breaks = c(0, 0.22),
+                      labels = c("Autumn", "Spring"),
+                      limits = c(-0.1, 0.32)) +
+  labs(
+    #subtitle = str_wrap("season: p = 0.054 . | experience: p = 0.650 | interaction: p = 0.326", width = 50),
+    x        = "Season",
+    y        = "Distance (km)",
+    fill     = NULL, color = NULL
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.02, 0.96),
+    legend.justification = c(0, 1),
+    legend.background = element_rect(fill = "white", color = NA),
+    plot.subtitle = element_text(size = 9, color = "grey50")
+  )
+
+ggsave("C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/Figures principales/distance_by_season.png", 
+       width = 4, height = 5, dpi = 300)
+
+# Taille d'effet
+
+conflicts_prefer(dplyr::select)
+library(dplyr)
+library(tidyr)
+
+# Variation saisonnière pour chaque classe d'âge
+var_season_dist <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = season, values_from = predicted) %>%
+  mutate(
+    variation_percent = (spring - autumn) / autumn * 100
+  )
+
+var_season_dist
+
+# Variation entre âges pour chaque saison
+var_age_dist <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = age_group, values_from = predicted) %>%
+  mutate(
+    variation_percent = (juvenile - adult) / adult * 100
+  )
+
+var_age_dist
+```
+
+## Durée de traversée de la Zone_G
+
+### Calcul de la durée de traversée
+
+```{r}
+conflicts_prefer(dplyr::filter)
+spring_duree_traversee <- data_sub5_spring_G %>%
+  mutate(year = year(date)) %>%
+  group_by(ID, year, age_group) %>%
+  summarise(
+    date_debut = min(timestamp, na.rm = TRUE),
+    date_fin = max(timestamp, na.rm = TRUE),
+    duree_traversee = as.numeric(date_fin - date_debut),
+    .groups = "drop"
+  )
+spring_duree_traversee
+str(data_sub5_spring_G)
+
+autumn_duree_traversee <- data_sub5_autumn_G %>%
+  mutate(year = year(date)) %>%
+  group_by(ID, year, age_group) %>%
+  summarise(
+    date_debut = min(timestamp, na.rm = TRUE),
+    date_fin = max(timestamp, na.rm = TRUE),
+    duree_traversee = as.numeric(date_fin - date_debut),
+    .groups = "drop"
+  )
+autumn_duree_traversee
+
+
+### date de départ
+
+spring_duree_traversee$date_debut
+autumn_duree_traversee$date_debut
+
+date_debut_spring_adult <- spring_duree_traversee %>%
+  filter(age_group == "adult") %>%
+  dplyr::select(date_debut)
+date_debut_spring_adult
+
+date_debut_spring_juvenile <- spring_duree_traversee %>%
+  filter(age_group == "juvenile") %>%
+  dplyr::select(date_debut)
+date_debut_spring_juvenile
+
+date_debut_autumn_adult <- autumn_duree_traversee %>%
+  filter(age_group == "adult") %>%
+  dplyr::select(date_debut)
+date_debut_autumn_adult
+
+date_debut_autumn_juvenile <- autumn_duree_traversee %>%
+  filter(age_group == "juvenile") %>%
+  dplyr::select(date_debut)
+date_debut_autumn_juvenile
+```
+
+### Représentation par ID
+
+```{r}
+ggplot(spring_duree_traversee,
+       aes(x = ID,
+           y = duree_traversee)) +
+  geom_jitter(width = 0.1, size = 3, alpha = 0.7) +
+  geom_text(aes(label = year),
+            vjust = -0.5, size = 3) +
+  labs(
+    x = "Individuals",
+    y = "Travel time (days)"
+  ) +
+  theme_minimal()
+
+ggplot(autumn_duree_traversee,
+       aes(x = ID,
+           y = duree_traversee)) +
+  geom_jitter(width = 0.1, size = 3, alpha = 0.7) +
+  geom_text(aes(label = year),
+            vjust = -0.5, size = 3) +
+  labs(
+    x = "Individuals",
+    y = "Travel time (days)"
+  ) +
+  theme_minimal()
+```
+
+### Représentation et test par age_group
+
+```{r}
+conflicts_prefer(lmerTest::lmer)
+# Représentation avec chaque individu
+ggplot(spring_duree_traversee,
+       aes(x = age_group, y = duree_traversee)) +
+  geom_jitter(width = 0.1, size = 3, alpha = 0.7) +
+  labs(
+    x = "age_group",
+    y = "Travel time (days)"
+  ) +
+  theme_minimal()
+
+ggplot(autumn_duree_traversee,
+       aes(x = age_group, y = duree_traversee)) +
+  geom_jitter(width = 0.1, size = 3, alpha = 0.7) +
+  labs(
+    x = "age_group",
+    y = "Travel time (days)"
+  ) +
+  theme_minimal()
+
+# Regroupement
+duree_all <- bind_rows(
+  spring_duree_traversee %>% mutate(season = "spring"),
+  autumn_duree_traversee %>% mutate(season = "autumn")
+)
+duree_all$season <- as.factor(duree_all$season)
+
+# lme
+lme_duree1 <- lmer(duree_traversee ~ age_group + season + (1|ID), data = duree_all)
+summary(lme_duree1)
+lme_duree2 <- lmer(duree_traversee ~ age_group + season + age_group:season + (1|ID), data = duree_all)
+summary(lme_duree2)
+
+AIC (lme_duree1, lme_duree2)
+r2(lme_duree2)
+
+# Représentation avec p-value
+#####
+library(stringr)
+library(ggeffects)
+library(ggplot2)
+
+# Grille de prédiction avec IC
+pred <- ggpredict(lme_duree2, terms = c("season", "age_group"))
+new_data <- as.data.frame(pred)
+colnames(new_data)[colnames(new_data) == "x"]     <- "season"
+colnames(new_data)[colnames(new_data) == "group"] <- "age_group"
+new_data$season_num <- ifelse(new_data$season == "autumn", 0, 0.22)
+duree_all$season_num <- ifelse(duree_all$season == "autumn", 0, 0.22)
+
+ggplot(new_data, aes(x = season_num, y = predicted,
+                     fill = age_group, group = age_group)) +
+  geom_col(position = position_dodge(0.16),
+           width = 0.16,
+           alpha = 0.7,
+           color = "black") +
+  geom_jitter(data = duree_all,
+              aes(x = season_num, y = duree_traversee, color = age_group),
+              position = position_jitterdodge(jitter.width = 0.025, dodge.width = 0.16),
+              alpha = 0.8, size = 1.8, inherit.aes = FALSE) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.045, linewidth = 0.7,
+                position = position_dodge(0.16)) +
+  scale_fill_manual(values = c("adult" = "#00B074", "juvenile" = "#FF9F1C"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_color_manual(values = c("adult" = "#00693F", "juvenile" = "#C96A00"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_x_continuous(breaks = c(0, 0.22),
+                      labels = c("Autumn", "Spring"),
+                      limits = c(-0.1, 0.32)) +
+  labs(
+    #subtitle = str_wrap("season: p = 0.020 * | experience: 0.448 | interaction: 0.542", width = 50),
+    x        = "Season",
+    y        = "Crossing duration (days)",
+    fill     = NULL, color = NULL
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.02, 0.96),
+    legend.justification = c(0, 1),
+    legend.background = element_rect(fill = "white", color = NA),
+    plot.subtitle = element_text(size = 9, color = "grey50")
+  )
+ggsave("C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/Figures principales/duree_by_season.png", 
+       width = 4, height = 5, dpi = 300)
+
+
+# Taille d'effet
+
+conflicts_prefer(dplyr::select)
+library(dplyr)
+library(tidyr)
+
+# Variation saisonnière pour chaque classe d'âge
+var_season_duration <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = season, values_from = predicted) %>%
+  mutate(
+    variation_percent = (spring - autumn) / autumn * 100
+  )
+
+var_season_duration
+
+# Variation entre âges pour chaque saison
+var_age_duration <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = age_group, values_from = predicted) %>%
+  mutate(
+    variation_percent = (juvenile - adult) / adult * 100
+  )
+
+var_age_duration
+
+
+```
+
+## N duree et dist
+
+```{r}
+# N
+summary(data_sub5_spring_G)
+summary(data_sub5_autumn_G)
+summary(distances_spring)
+summary(distances_autumn)
+```
+
+## Distances traversée zone_Z = Zone interet
+
+### Calcul de la distance
+
+```{r}
+# Spring
+distances_spring <- data_sub5_spring_Z %>%
+  arrange(ID, timestamp) %>%
+  mutate(
+    year = year(timestamp),
+    lon_next = lead(lon.x),
+    lat_next = lead(lat.x),
+    id_next = lead(ID),
+    year_next = lead(year),
+    
+    dist = ifelse(
+      ID == id_next & year == year_next,
+      distHaversine(cbind(lon.x, lat.x), cbind(lon_next, lat_next)),
+      NA
+    )
+  ) %>%
+  group_by(ID, year, age_group) %>%
+  summarise(
+    dist_km = sum(dist, na.rm = TRUE) / 1000,
+    .groups = "drop"
+  )
+distances_spring
+
+# Autumn
+distances_autumn <- data_sub5_autumn_Z %>%
+  arrange(ID, timestamp) %>%
+  mutate(
+    year = year(timestamp),
+    lon_next = lead(lon.x),
+    lat_next = lead(lat.x),
+    id_next = lead(ID),
+    year_next = lead(year),
+    
+    dist = ifelse(
+      ID == id_next & year == year_next,
+      distHaversine(cbind(lon.x, lat.x), cbind(lon_next, lat_next)),
+      NA
+    )
+  ) %>%
+  group_by(ID, year, age_group) %>%
+  summarise(
+    dist_km = sum(dist, na.rm = TRUE) / 1000,
+    .groups = "drop"
+  )
+distances_autumn
+```
+
+### Représentation et test
+
+```{r}
+# Regroupement
+distances_all <- bind_rows(
+  distances_spring %>% mutate(season = "spring"),
+  distances_autumn %>% mutate(season = "autumn")
+)
+distances_all$age_group <- as.factor (distances_all$age_group)
+
+# lme
+lme_dist1 <- lmer(dist_km ~ age_group + season + (1|ID), data = distances_all)
+summary(lme_dist1)
+lme_dist2 <- lmer(dist_km ~ age_group + season + age_group : season + (1|ID), data = distances_all)
+summary(lme_dist2)
+
+AIC (lme_dist1, lme_dist2) # lme_dist2
+
+# Représentation
+library(ggeffects)
+library(ggplot2)
+library(ggsignif)
+
+# Grille de prédiction avec IC
+pred <- ggpredict(lme_dist2, terms = c("season", "age_group"))
+
+# Renommer pour clarté
+new_data <- as.data.frame(pred)
+colnames(new_data)[colnames(new_data) == "x"]     <- "season"
+colnames(new_data)[colnames(new_data) == "group"] <- "age_group"
+
+# Représentation
+
+#####
+library(stringr)
+
+new_data$season_num <- ifelse(new_data$season == "autumn", 0, 0.22)
+distances_all$season_num <- ifelse(distances_all$season == "autumn", 0, 0.22)
+
+ggplot(new_data, aes(x = season_num, y = predicted,
+                     fill = age_group, group = age_group)) +
+  geom_col(position = position_dodge(0.16),
+           width = 0.16,
+           alpha = 0.7,
+           color = "black") +
+  geom_jitter(data = distances_all,
+              aes(x = season_num, y = dist_km, color = age_group),
+              position = position_jitterdodge(jitter.width = 0.025, dodge.width = 0.16),
+              alpha = 0.8, size = 1.8, inherit.aes = FALSE) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.045, linewidth = 0.7,
+                position = position_dodge(0.16)) +
+  scale_fill_manual(values = c("adult" = "#00B074", "juvenile" = "#FF9F1C"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_color_manual(values = c("adult" = "#00693F", "juvenile" = "#C96A00"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_x_continuous(breaks = c(0, 0.22),
+                      labels = c("Autumn", "Spring"),
+                      limits = c(-0.1, 0.32)) +
+  labs(
+    x        = "Season",
+    y        = "Distance (km)",
+    fill     = NULL, color = NULL
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.02, 0.96),
+    legend.justification = c(0, 1),
+    legend.background = element_rect(fill = "white", color = NA),
+    plot.subtitle = element_text(size = 9, color = "grey50")
+  )
+
+ggsave("C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/distance_by_season_Z.png", 
+       width = 4, height = 5, dpi = 300)
+
+# Taille d'effet
+
+conflicts_prefer(dplyr::select)
+library(dplyr)
+library(tidyr)
+
+# Variation saisonnière pour chaque classe d'âge
+var_season_dist <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = season, values_from = predicted) %>%
+  mutate(
+    variation_percent = (spring - autumn) / autumn * 100
+  )
+
+var_season_dist
+
+# Variation entre âges pour chaque saison
+var_age_dist <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = age_group, values_from = predicted) %>%
+  mutate(
+    variation_percent = (juvenile - adult) / adult * 100
+  )
+
+var_age_dist
+```
+
+## Durée traversée Zone_Z
+
+### Calcul durées
+
+```{r}
+conflicts_prefer(dplyr::filter)
+spring_duree_traversee <- data_sub5_spring_Z %>%
+  mutate(year = year(date)) %>%
+  group_by(ID, year, age_group) %>%
+  summarise(
+    date_debut = min(timestamp, na.rm = TRUE),
+    date_fin = max(timestamp, na.rm = TRUE),
+    duree_traversee = as.numeric(date_fin - date_debut),
+    .groups = "drop"
+  )
+spring_duree_traversee
+str(data_sub5_spring_G)
+
+autumn_duree_traversee <- data_sub5_autumn_Z %>%
+  mutate(year = year(date)) %>%
+  group_by(ID, year, age_group) %>%
+  summarise(
+    date_debut = min(timestamp, na.rm = TRUE),
+    date_fin = max(timestamp, na.rm = TRUE),
+    duree_traversee = as.numeric(date_fin - date_debut),
+    .groups = "drop"
+  )
+autumn_duree_traversee
+
+
+### date de départ
+
+spring_duree_traversee$date_debut
+autumn_duree_traversee$date_debut
+
+date_debut_spring_adult <- spring_duree_traversee %>%
+  filter(age_group == "adult") %>%
+  dplyr::select(date_debut)
+date_debut_spring_adult
+
+date_debut_spring_juvenile <- spring_duree_traversee %>%
+  filter(age_group == "juvenile") %>%
+  dplyr::select(date_debut)
+date_debut_spring_juvenile
+
+date_debut_autumn_adult <- autumn_duree_traversee %>%
+  filter(age_group == "adult") %>%
+  dplyr::select(date_debut)
+date_debut_autumn_adult
+
+date_debut_autumn_juvenile <- autumn_duree_traversee %>%
+  filter(age_group == "juvenile") %>%
+  dplyr::select(date_debut)
+date_debut_autumn_juvenile
+```
+
+### Représentations et test
+
+```{r}
+conflicts_prefer(lmerTest::lmer)
+# Représentation avec chaque individu
+ggplot(spring_duree_traversee,
+       aes(x = age_group, y = duree_traversee)) +
+  geom_jitter(width = 0.1, size = 3, alpha = 0.7) +
+  labs(
+    x = "age_group",
+    y = "Travel time (days)"
+  ) +
+  theme_minimal()
+
+ggplot(autumn_duree_traversee,
+       aes(x = age_group, y = duree_traversee)) +
+  geom_jitter(width = 0.1, size = 3, alpha = 0.7) +
+  labs(
+    x = "age_group",
+    y = "Travel time (days)"
+  ) +
+  theme_minimal()
+
+# Regroupement
+duree_all <- bind_rows(
+  spring_duree_traversee %>% mutate(season = "spring"),
+  autumn_duree_traversee %>% mutate(season = "autumn")
+)
+duree_all$season <- as.factor(duree_all$season)
+
+# lme
+lme_duree1 <- lmer(duree_traversee ~ age_group + season + (1|ID), data = duree_all)
+summary(lme_duree1)
+lme_duree2 <- lmer(duree_traversee ~ age_group + season + age_group:season + (1|ID), data = duree_all)
+summary(lme_duree2)
+
+AIC (lme_duree1, lme_duree2)
+r2(lme_duree2)
+
+# Représentation avec p-value
+#####
+library(stringr)
+library(ggeffects)
+library(ggplot2)
+
+# Grille de prédiction avec IC
+pred <- ggpredict(lme_duree2, terms = c("season", "age_group"))
+new_data <- as.data.frame(pred)
+colnames(new_data)[colnames(new_data) == "x"]     <- "season"
+colnames(new_data)[colnames(new_data) == "group"] <- "age_group"
+new_data$season_num <- ifelse(new_data$season == "autumn", 0, 0.22)
+duree_all$season_num <- ifelse(duree_all$season == "autumn", 0, 0.22)
+
+ggplot(new_data, aes(x = season_num, y = predicted,
+                     fill = age_group, group = age_group)) +
+  geom_col(position = position_dodge(0.16),
+           width = 0.16,
+           alpha = 0.7,
+           color = "black") +
+  geom_jitter(data = duree_all,
+              aes(x = season_num, y = duree_traversee, color = age_group),
+              position = position_jitterdodge(jitter.width = 0.025, dodge.width = 0.16),
+              alpha = 0.8, size = 1.8, inherit.aes = FALSE) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.045, linewidth = 0.7,
+                position = position_dodge(0.16)) +
+  scale_fill_manual(values = c("adult" = "#00B074", "juvenile" = "#FF9F1C"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_color_manual(values = c("adult" = "#00693F", "juvenile" = "#C96A00"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_x_continuous(breaks = c(0, 0.22),
+                      labels = c("Autumn", "Spring"),
+                      limits = c(-0.1, 0.32)) +
+  labs(
+    x        = "Season",
+    y        = "Crossing duration (days)",
+    fill     = NULL, color = NULL
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.02, 0.96),
+    legend.justification = c(0, 1),
+    legend.background = element_rect(fill = "white", color = NA),
+    plot.subtitle = element_text(size = 9, color = "grey50")
+  )
+ggsave("C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/duree_by_season_Z.png", 
+       width = 4, height = 5, dpi = 300)
+
+
+# Taille d'effet
+
+conflicts_prefer(dplyr::select)
+library(dplyr)
+library(tidyr)
+
+# Variation saisonnière pour chaque classe d'âge
+var_season_duration <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = season, values_from = predicted) %>%
+  mutate(
+    variation_percent = (spring - autumn) / autumn * 100
+  )
+
+var_season_duration
+
+# Variation entre âges pour chaque saison
+var_age_duration <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = age_group, values_from = predicted) %>%
+  mutate(
+    variation_percent = (juvenile - adult) / adult * 100
+  )
+
+var_age_duration
+
+
+```
+
+## Hauteur-sol (Par sub HF)
+
+```{r}
+# height.above.ground_GPS
+
+# lme
+lme_height1 <- lmer(height.above.ground_GPS ~ age_group + MIGRATION + (1|ID), data = TRACKS_HF_2026_HEIGHT_Z)
+summary(lme_height1)
+lme_height2 <- lmer(height.above.ground_GPS ~ age_group + MIGRATION + (1|ID) + age_group:MIGRATION, data = TRACKS_HF_2026_HEIGHT_Z)
+summary(lme_height1)
+
+AIC(lme_height1, lme_height2) # lm_height2
+summary(lme_height2)
+r2(lme_height2)
+# R² marginal  = variance expliquée par les effets fixes seuls
+# R² conditionnel = variance expliquée par fixes + aléatoires (ID)
+
+## Représentation lme
+#####
+library(stringr)
+library(ggeffects)
+library(ggplot2)
+
+# Effets prédits
+pred <- ggpredict(lme_height2, terms = c("MIGRATION", "age_group"))
+new_data <- as.data.frame(pred)
+colnames(new_data)[colnames(new_data) == "x"]     <- "season"
+colnames(new_data)[colnames(new_data) == "group"] <- "age_group"
+
+# Valeurs R²
+r2_cond <- 0.068
+r2_marg <- 0.021
+#r2_label <- paste0("Marginal R² = ", r2_marg, " | Conditional R² = ", r2_cond)
+
+TRACKS_HF_2026_HEIGHT_Z$season <- TRACKS_HF_2026_HEIGHT_Z$MIGRATION
+
+new_data$season_num <- ifelse(new_data$season == "autumn", 0, 0.22)
+TRACKS_HF_2026_HEIGHT_Z$season_num <- ifelse(TRACKS_HF_2026_HEIGHT_Z$season == "autumn", 0, 0.22)
+
+library(scales)
+
+ggplot(new_data, aes(x = season_num, y = predicted,
+                     fill = age_group, group = age_group)) +
+  geom_col(position = position_dodge(0.16),
+           width = 0.16,
+           alpha = 0.7,
+           color = "black") +
+  geom_jitter(data = TRACKS_HF_2026_HEIGHT_Z,
+            aes(x = season_num, y = height.above.ground_GPS, color = age_group),
+            position = position_jitterdodge(jitter.width = 0.025, dodge.width = 0.16),
+            alpha = 0.10, size = 1, inherit.aes = FALSE) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.045, linewidth = 0.7,
+                position = position_dodge(0.16)) +
+  scale_fill_manual(values = c("adult" = "#00B074", "juvenile" = "#FF9F1C"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_color_manual(values = c("adult" = "#00693F", "juvenile" = "#C96A00"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_x_continuous(breaks = c(0, 0.22),
+                      labels = c("Autumn", "Spring"),
+                      limits = c(-0.1, 0.32)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10)) +   # <- plus de graduations
+  labs(
+    x        = "Season",
+    y        = "Height above ground level (m)",
+    fill     = NULL, color = NULL
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.02, 0.96),
+    legend.justification = c(0, 1),
+    legend.background = element_rect(fill = "white", color = NA),
+    plot.subtitle   = element_text(size = 9, color = "grey50"),
+    plot.caption    = element_text(size = 8, color = "grey50", hjust = 0),
+    axis.text.y     = element_text(size = 12)   # <- taille des chiffres en ordonnée
+  )
+
+ggsave("C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/Figures principales/height_by_season.png", 
+       width = 4, height = 5, dpi = 300)
+
+
+
+################## Taille d'effet : Pourcentage de variation
+
+library(dplyr)
+library(tidyr)
+str(new_data)
+# Variation saisonnière pour chaque classe d'âge
+var_season_height <- new_data %>%
+  dplyr::select(age_group, season, predicted) %>%
+  tidyr::pivot_wider(
+    names_from = season,
+    values_from = predicted
+  ) %>%
+  dplyr::mutate(
+    variation_percent = (spring - autumn) / autumn * 100
+  )
+var_season_height
+
+# Variation entre âges pour chaque saison
+var_age_height <- new_data %>%
+  dplyr::select(age_group, season, predicted) %>%
+  tidyr::pivot_wider(
+    names_from = age_group,
+    values_from = predicted
+  ) %>%
+  dplyr::mutate(
+    variation_percent = (juvenile - adult) / adult * 100
+  )
+var_age_height
+```
+
+### N stats height
+
+```{r}
+summary(TRACKS_HF_2026_HEIGHT_Z)
+summary(TRACKS_HF_2026_HEIGHT_spring_Z)
+summary(TRACKS_HF_2026_HEIGHT_autumn_Z)
+
+# nb ID
+length(unique(TRACKS_HF_2026_HEIGHT_Z$individual.local.identifier))
+# ou pour le détail par saison :
+table(TRACKS_HF_2026_HEIGHT_spring_Z$individual.local.identifier)
+table(TRACKS_HF_2026_HEIGHT_autumn_Z$individual.local.identifier)
+```
+
+## La vitesse GPS (Par sub HF)
+
+```{r}
+library(conflicted)
+conflicts_prefer(lmerTest::lmer)
+
+# ground.speed
+
+
+# Modèle linéaire
+
+# lme
+lme_speed1 <- lmer(ground.speed ~ age_group + MIGRATION + (1|ID), data = TRACKS_HF_2026_SPEED_Z)
+lme_speed2 <- lmer(ground.speed ~ age_group + MIGRATION + age_group : MIGRATION + (1|ID), data = TRACKS_HF_2026_SPEED_Z)
+summary(lme_speed2)
+
+AIC (lme_speed1,lme_speed2)
+summary(lme_speed2)
+r2(lme_speed2)
+# R² marginal  = variance expliquée par les effets fixes seuls
+# R² conditionnel = variance expliquée par fixes + aléatoires (ID)
+
+
+## Représentation lme
+#####
+library(stringr)
+library(ggeffects)
+library(ggplot2)
+
+# Effets prédits
+pred <- ggpredict(lme_speed2, terms = c("MIGRATION", "age_group"))
+new_data <- as.data.frame(pred)
+colnames(new_data)[colnames(new_data) == "x"]     <- "season"
+colnames(new_data)[colnames(new_data) == "group"] <- "age_group"
+
+# Valeurs R²
+r2_cond <- 0.032
+r2_marg <- 0.004
+#r2_label <- paste0("Marginal R² = ", r2_marg, " | Conditional R² = ", r2_cond)
+
+TRACKS_HF_2026_SPEED_Z$season <- TRACKS_HF_2026_SPEED_Z$MIGRATION
+
+new_data$season_num <- ifelse(new_data$season == "autumn", 0, 0.22)
+TRACKS_HF_2026_SPEED_Z$season_num <- ifelse(TRACKS_HF_2026_SPEED_Z$season == "autumn", 0, 0.22)
+
+ggplot(new_data, aes(x = season_num, y = predicted,
+                     fill = age_group, group = age_group)) +
+  geom_col(position = position_dodge(0.16),
+           width = 0.16,
+           alpha = 0.7,
+           color = "black") +
+  geom_jitter(data = TRACKS_HF_2026_SPEED_Z,
+            aes(x = season_num, y = ground.speed, color = age_group),
+            position = position_jitterdodge(jitter.width = 0.025, dodge.width = 0.16),
+            alpha = 0.05, size = 1, inherit.aes = FALSE) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.045, linewidth = 0.7,
+                position = position_dodge(0.16)) +
+  scale_fill_manual(values = c("adult" = "#00B074", "juvenile" = "#FF9F1C"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_color_manual(values = c("adult" = "#00693F", "juvenile" = "#C96A00"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_x_continuous(breaks = c(0, 0.22),
+                      labels = c("Autumn", "Spring"),
+                      limits = c(-0.1, 0.32)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10)) +   # <- plus de graduations
+  labs(
+    x        = "Season",
+    y        = "Ground speed (m/s)",
+    fill     = NULL, color = NULL
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.02, 0.96),
+    legend.justification = c(0, 1),
+    legend.background = element_rect(fill = "white", color = NA),
+    plot.subtitle   = element_text(size = 9, color = "grey50"),
+    plot.caption    = element_text(size = 8, color = "grey50", hjust = 0),
+    axis.text.y     = element_text(size = 12)   # <- taille des chiffres en ordonnée
+  )
+
+ggsave("C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/Figures principales/speed_by_season.png", 
+       width = 4, height = 5, dpi = 300)
+
+
+
+################## Taille d'effet : Pourcentage de variation
+conflicts_prefer(dplyr::select)
+library(dplyr)
+library(tidyr)
+
+# Variation saisonnière pour chaque classe d'âge
+var_season_speed <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = season, values_from = predicted) %>%
+  mutate(
+    variation_percent = (spring - autumn) / autumn * 100
+  )
+
+var_season_speed
+
+# Variation entre âges pour chaque saison
+var_age_speed <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = age_group, values_from = predicted) %>%
+  mutate(
+    variation_percent = (juvenile - adult) / adult * 100
+  )
+
+var_age_speed
+```
+
+### N stat speed
+
+```{r}
+summary(TRACKS_HF_2026_SPEED_Z)
+summary(TRACKS_HF_2026_SPEED_spring_Z)
+summary(TRACKS_HF_2026_SPEED_autumn_Z)
+
+# nb ID
+length(unique(TRACKS_HF_2026_SPEED_Z$individual.local.identifier))
+# ou pour le détail par saison :
+table(TRACKS_HF_2026_SPEED_spring_Z$individual.local.identifier)
+table(TRACKS_HF_2026_SPEED_autumn_Z$individual.local.identifier)
+```
+
+## Le gain d'altitude par 30 min
+
+```{r}
+# lme
+lme_alt1 <- lmer(alt_gain_30min ~ age_group + MIGRATION + (1|ID), data = TRACKS_HF_2026_ALT_Z)
+lme_alt2 <- lmer(alt_gain_30min ~ age_group + MIGRATION + age_group : MIGRATION + (1|ID), data = TRACKS_HF_2026_ALT_Z)
+summary(lme_alt2)
+
+AIC (lme_alt1, lme_alt2)
+summary(lme_alt2)
+r2(lme_alt2)
+# R² marginal  = variance expliquée par les effets fixes seuls
+# R² conditionnel = variance expliquée par fixes + aléatoires (ID)
+
+
+## Représentation lme
+#####
+library(stringr)
+library(ggeffects)
+library(ggplot2)
+
+# Effets prédits
+pred <- ggpredict(lme_alt2, terms = c("MIGRATION", "age_group"))
+new_data <- as.data.frame(pred)
+colnames(new_data)[colnames(new_data) == "x"]     <- "season"
+colnames(new_data)[colnames(new_data) == "group"] <- "age_group"
+
+# Valeurs R²
+r2_cond <- 0.048
+r2_marg <- 0.024
+#r2_label <- paste0("Marginal R² = ", r2_marg, " | Conditional R² = ", r2_cond)
+
+TRACKS_HF_2026_ALT_Z$season <- TRACKS_HF_2026_ALT_Z$MIGRATION
+
+new_data$season_num <- ifelse(new_data$season == "autumn", 0, 0.22)
+TRACKS_HF_2026_ALT_Z$season_num <- ifelse(TRACKS_HF_2026_ALT_Z$season == "autumn", 0, 0.22)
+
+ggplot(new_data, aes(x = season_num, y = predicted,
+                     fill = age_group, group = age_group)) +
+  geom_col(position = position_dodge(0.16),
+           width = 0.16,
+           alpha = 0.7,
+           color = "black") +
+  geom_jitter(data = TRACKS_HF_2026_ALT_Z,
+            aes(x = season_num, y = alt_gain_30min, color = age_group),
+            position = position_jitterdodge(jitter.width = 0.025, dodge.width = 0.16),
+            alpha = 0.20, size = 1, inherit.aes = FALSE) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.045, linewidth = 0.7,
+                position = position_dodge(0.16)) +
+  scale_fill_manual(values = c("adult" = "#00B074", "juvenile" = "#FF9F1C"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_color_manual(values = c("adult" = "#00693F", "juvenile" = "#C96A00"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_x_continuous(breaks = c(0, 0.22),
+                      labels = c("Autumn", "Spring"),
+                      limits = c(-0.1, 0.32)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10)) +   # <- plus de graduations
+  labs(
+    x        = "Season",
+    y        = "30min altitude gain (m)",
+    fill     = NULL, color = NULL
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.02, 0.96),
+    legend.justification = c(0, 1),
+    legend.background = element_rect(fill = "white", color = NA),
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(size = 9, color = "grey50"),
+    plot.caption    = element_text(size = 8, color = "grey50", hjust = 0),
+    axis.text.y     = element_text(size = 12)   # <- taille des chiffres en ordonnée
+  )
+ggsave("C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/Figures principales/alt_gain_by_season.png", 
+       width = 4, height = 5, dpi = 300)
+
+
+################## Taille d'effet : Pourcentage de variation
+ conflicts_prefer(dplyr::select)
+library(dplyr)
+library(tidyr)
+
+# Variation saisonnière pour chaque classe d'âge
+var_season_alt <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = season, values_from = predicted) %>%
+  mutate(
+    variation_percent = (spring - autumn) / autumn * 100
+  )
+
+var_season_alt
+
+# Variation entre âges pour chaque saison
+var_age_alt <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = age_group, values_from = predicted) %>%
+  mutate(
+    variation_percent = (juvenile - adult) / adult * 100
+  )
+
+var_age_alt
+```
+
+### N stat alt gain
+
+```{r}
+summary(TRACKS_HF_2026_ALT_Z)
+summary(TRACKS_HF_2026_ALT_spring_Z)
+summary(TRACKS_HF_2026_ALT_autumn_Z)
+
+# nb ID
+length(unique(TRACKS_HF_2026_ALT_Z$individual.local.identifier))
+# ou pour le détail par saison :
+table(TRACKS_HF_2026_ALT_spring_Z$individual.local.identifier)
+table(TRACKS_HF_2026_ALT_autumn_Z$individual.local.identifier)
+```
+
+## Tortuosité (distance) sur le SAHARA
+
+(Avec day_dist_3 = Somme des distances par jour entre chaque point à 5min d'intervalle calculé comme ddist_2D_for_day_dist_3 \<- data_sub5_day\$ddist_2D)
+
+```{r}
+# Calcul de la tortuosité
+
+# -- Montée - Printemps
+
+# Distance minimale entre départ et arrivée
+# Reconstruction du point de départ et d'arrivé à partir de location.lat et location.long
+dist_min_spring <- DATA_HF_spring_Z %>%
+  group_by(ID, year) %>%
+  arrange(timestamp) %>%
+  summarise(
+    lon_depart = first(location.long),
+    lat_depart = first(location.lat),
+    lon_arrivee = last(location.long),
+    lat_arrivee = last(location.lat),
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    dist_min = distHaversine(c(lon_depart, lat_depart),
+                             c(lon_arrivee, lat_arrivee)) / 1000  # km
+  )
+dist_min_spring
+# Distance réelle
+dist_totale_spring <- DAYTABLE_2026_spring_Z %>%
+  group_by(ID, year) %>%
+  summarise(dist_totale = sum(day_dist_3, na.rm = TRUE),
+            age_group = first(age_group),  # récupère l'âge du trajet
+            .groups = "drop")
+
+# Calcul de la tortuosité par ID et par year
+tortuosite_spring <- dist_totale_spring %>%
+  left_join(dist_min_spring, by = c("ID", "year")) %>%
+  mutate(tortuosite = dist_totale / dist_min,
+         type = "Montee")
+
+# -- Descente - Automne
+
+# Distance minimale entre départ et arrivée
+# Reconstruction du point de départ et d'arrivé à partir de first_lat et last_lat #etc
+dist_min_autumn <- DATA_HF_autumn_Z %>%
+  group_by(ID, year) %>%
+  arrange(timestamp) %>%
+  summarise(
+    lon_depart = first(location.long),
+    lat_depart = first(location.lat),
+    lon_arrivee = last(location.long),
+    lat_arrivee = last(location.lat),
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    dist_min = distHaversine(c(lon_depart, lat_depart),
+                             c(lon_arrivee, lat_arrivee)) / 1000  # km
+  )
+
+# Distance réelle
+dist_totale_autumn <- DAYTABLE_2026_autumn_Z %>%
+  group_by(ID, year) %>%
+  summarise(dist_totale = sum(day_dist_3, na.rm = TRUE),
+            age_group = first(age_group),  # récupère l'âge du trajet
+            .groups = "drop")
+
+# Calcul de la tortuosité par ID et par year
+tortuosite_autumn <- dist_totale_autumn %>%
+  left_join(dist_min_autumn, by = c("ID", "year")) %>%
+  mutate(tortuosite = dist_totale / dist_min,
+         type = "Descente")
+
+
+
+# Regroupement : Printemps + Automne
+tort_all <- bind_rows(
+  tortuosite_spring %>% mutate(season = "spring"),
+  tortuosite_autumn %>% mutate(season = "autumn")
+)
+
+# Anomalies
+tort_all <- tort_all[!(tort_all$ID == "Barben" & tort_all$year == 2021), ] # Anomalie
+tort_all <- tort_all %>%
+  mutate(tortuosite = if_else(tortuosite < 1, 1.1, tortuosite))
+str(tort_all)
+
+#excel
+library(writexl)
+write_xlsx(tort_all, "C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/tortuosite.xlsx")
+str(tort_all)
+# tableau
+library(flextable)
+
+ft <- tort_all %>%
+  select(ID, year, age_group, type, dist_totale, dist_min, tortuosite) %>%
+  rename(
+    "ID"                          = ID,
+    "Year"                        = year,
+    "Experience"                  = age_group,
+    "Migration"                   = type,
+    "Total distance (km)"         = dist_totale,
+    "Straight-line distance (km)" = dist_min,
+    "Tortuosity"                  = tortuosite
+  ) %>%
+  flextable() %>%
+  autofit() %>%
+  theme_vanilla() %>%
+  bold(part = "header")
+
+ft
+save_as_docx(ft, path = "C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/tortuosity_table.docx")
+```
+
+```{r}
+# Modèle linéaire à effet mixte (sur ID)
+lme_tort1 <- lmer(tortuosite ~ age_group + season + (1|ID), data = tort_all)
+summary(lme_tort1)
+lme_tort2 <- lmer(tortuosite ~ age_group + season + age_group : season + (1|ID), data = tort_all)
+summary(lme_tort2)
+
+AIC (lme_tort1, lme_tort2)
+summary(lme_tort2)
+r2(lme_tort2)
+# R² marginal  = variance expliquée par les effets fixes seuls
+# R² conditionnel = variance expliquée par fixes + aléatoires (ID)
+
+
+## Représentation lme
+#####
+library(stringr)
+library(ggeffects)
+library(ggplot2)
+
+# Effets prédits
+pred <- ggpredict(lme_tort2, terms = c("season", "age_group"))
+new_data <- as.data.frame(pred)
+colnames(new_data)[colnames(new_data) == "x"]     <- "season"
+colnames(new_data)[colnames(new_data) == "group"] <- "age_group"
+
+# Valeurs R²
+r2_cond <- 0.233
+r2_marg <- 0.127
+#r2_label <- paste0("Marginal R² = ", r2_marg, " | Conditional R² = ", r2_cond)
+
+new_data$season_num <- ifelse(new_data$season == "autumn", 0, 0.22)
+tort_all$season_num <- ifelse(tort_all$season == "autumn", 0, 0.22)
+
+ggplot(new_data, aes(x = season_num, y = predicted,
+                     fill = age_group, group = age_group)) +
+  geom_col(position = position_dodge(0.16),
+           width = 0.16,
+           alpha = 0.7,
+           color = "black") +
+  geom_jitter(data = tort_all,
+            aes(x = season_num, y = tortuosite, color = age_group),
+            position = position_jitterdodge(jitter.width = 0.025, dodge.width = 0.16),
+            alpha = 0.40, size = 2, inherit.aes = FALSE) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.045, linewidth = 0.7,
+                position = position_dodge(0.16)) +
+  scale_fill_manual(values = c("adult" = "#00B074", "juvenile" = "#FF9F1C"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_color_manual(values = c("adult" = "#00693F", "juvenile" = "#C96A00"),
+                   labels = c("≥ 5 yrs", "≤ 3 yrs")) +
+  scale_x_continuous(breaks = c(0, 0.22),
+                      labels = c("Autumn", "Spring"),
+                      limits = c(-0.1, 0.32)) +
+  labs(
+    #subtitle = str_wrap("experience : p = 0.693 | season : p = 0.073 . | interaction experience:season : 0.701 | Marginal R² = 0.127 | Conditional R² = 0.233", width = 50),
+    x        = "Season",
+    y        = "Tortuosity",
+    fill     = NULL, color = NULL
+  ) +
+  theme_classic(base_size = 18) +
+  theme(
+    legend.position = "inside",
+    legend.position.inside = c(0.02, 0.96),
+    legend.justification = c(0, 1),
+    legend.background = element_rect(fill = "white", color = NA),
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(size = 9, color = "grey50"),
+    plot.caption    = element_text(size = 8, color = "grey50", hjust = 0)
+  )
+
+ggsave("C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/Figures principales/tortuosity_by_season.png", 
+       width = 4, height = 5, dpi = 300)
+
+
+################## Taille d'effet : Pourcentage de variation
+conflicts_prefer(dplyr::select)
+library(dplyr)
+library(tidyr)
+
+# Variation saisonnière pour chaque classe d'âge
+var_season_tort <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = season, values_from = predicted) %>%
+  mutate(
+    variation_percent = (spring - autumn) / autumn * 100
+  )
+
+var_season_tort
+
+# Variation entre âges pour chaque saison
+var_age_tort <- new_data %>%
+  select(age_group, season, predicted) %>%
+  pivot_wider(names_from = age_group, values_from = predicted) %>%
+  mutate(
+    variation_percent = (juvenile - adult) / adult * 100
+  )
+
+var_age_tort
+```
+
+=\> Aucune différence de tortuosité (distance) sur la zone sahara_z entre adultes et juvéniles au printemps comme en automne.
+
+### N stat TORT
+
+```{r}
+summary(tort_all)
+
+# nb ID
+length(unique(tort_all$ID))
+```
+
+## Proportion de mouvements
+
+### Proportion de mouvement par jour
+
+```{r}
+# DAYTABLE prop_move
+# height.above.ground_GPS
+
+# lme
+lme_move1 <- lmer(prop_move ~ age_group + MIGRATION + (1|ID), data = DAYTABLE_2026_Z)
+summary(lme_move1)
+lme_move2 <- lmer(prop_move ~ age_group + MIGRATION + age_group : MIGRATION + (1|ID), data = DAYTABLE_2026_Z)
+summary(lme_move2)
+
+AIC (lme_move1, lme_move2)
+summary(lme_move2)
+r2(lme_move2)
+# R² marginal  = variance expliquée par les effets fixes seuls
+# R² conditionnel = variance expliquée par fixes + aléatoires (ID)
+
+####################################
+# En recalculant la proportion de mouvement uniquement la journée à partir de data_all
+
+
+
+```
+
+## Regroupement des pourcentages de variations
+
+```{r}
+library(officer)
+library(flextable)
+library(dplyr)
+
+make_ft <- function(df) {
+  df %>%
+    dplyr::select(season, adult, juvenile, variation_percent, variable) %>%
+    flextable() %>%
+    autofit() %>%
+    theme_vanilla() %>%
+    bold(part = "header")
+}
+
+doc <- read_docx()
+
+# Tableau 1 : Age effect on flight performance variables
+var_age_performance <- bind_rows(
+  var_age_height %>% mutate(variable = "Height"),
+  var_age_speed  %>% mutate(variable = "Speed"),
+  var_age_alt    %>% mutate(variable = "Altitude gain")
+)
+
+doc <- body_add_par(
+  doc,
+  "Age-related variation in flight performance variables",
+  style = "heading 1"
+)
+
+doc <- body_add_flextable(
+  doc,
+  value = make_ft(var_age_performance)
+)
+
+
+# Tableau 2 : Age effect on movement variables
+var_age_movement <- bind_rows(
+  var_age_tort     %>% mutate(variable = "Tortuosity"),
+  var_age_duration %>% mutate(variable = "Duration"),
+  var_age_dist     %>% mutate(variable = "Distance")
+)
+
+doc <- body_add_par(
+  doc,
+  "Age-related variation in movement variables",
+  style = "heading 1"
+)
+
+doc <- body_add_flextable(
+  doc,
+  value = make_ft(var_age_movement)
+)
+
+
+print(
+  doc,
+  target = "C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/variation_age_variables.docx"
+)
+```
+
+# II. ECHELLE : JOURNEE
+
+```{r}
+# Modèle linéaire
+lm_daydist <- lm(day_dist_3 ~ age_group + MIGRATION, data = DAYTABLE_2026_Z)
+summary(lm_daydist)
+
+# lme
+lme_daydist1 <- lmer(day_dist_3 ~ age_group + MIGRATION + (1|ID), data = DAYTABLE_2026_Z)
+summary(lme_daydist1)
+lme_daydist2 <- lmer(day_dist_3 ~ age_group + MIGRATION + age_group : MIGRATION + (1|ID), data = DAYTABLE_2026_Z)
+summary(lme_daydist2)
+
+AIC (lme_daydist1, lme_daydist2)
+r2(lme_daydist2)
+```
+
+## Gain d'altitude : alt_gain à l'échelle de la journée (par 30min)
+
+```{r}
+#| eval: false
+#| include: false
+
+# Montée (printemps)
+
+# -------------------------------
+# PRINTEMPS - Montée
+# -------------------------------
+
+# Modèles linéaires / polynomiaux
+mod1 <- lmer(alt_gain_30min ~ 1 + (1|ID), data = TRACKS_HF_2026_ALT_spring_Z)
+mod2 <- lmer(alt_gain_30min ~ temps_depuis_sunrise + (1|ID), data = TRACKS_HF_2026_ALT_spring_Z)
+mod3 <- lmer(alt_gain_30min ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2) + (1|ID), data = TRACKS_HF_2026_ALT_spring_Z)
+mod4 <- lmer(alt_gain_30min ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2) + age_group + (1|ID), data = TRACKS_HF_2026_ALT_spring_Z)
+mod5 <- lmer(alt_gain_30min ~ temps_depuis_sunrise + age_group + (1|ID), data = TRACKS_HF_2026_ALT_spring_Z)
+
+# Résumé et comparaison AIC
+summary(mod1); summary(mod2); summary(mod3); summary(mod4); summary(mod5)
+AIC(mod1, mod2, mod3, mod4, mod5)
+
+# Modèle choisi
+mod4 <- lmer(alt_gain_30min ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2) + age_group + (1|ID), data = TRACKS_HF_2026_ALT_spring_Z)
+summary(mod4) # OK
+# Axe pour les prédictions
+heure_seq <- seq(
+  min(TRACKS_HF_2026_ALT_spring_Z$temps_depuis_sunrise, na.rm = TRUE),
+  max(TRACKS_HF_2026_ALT_spring_Z$temps_depuis_sunrise, na.rm = TRUE),
+  0.1
+)
+
+groupes <- c("juvenile", "adult")
+
+# Graphique vide
+plot(alt_gain_30min ~ temps_depuis_sunrise, type = "n",
+     data = TRACKS_HF_2026_ALT_spring_Z,
+     xlab = "Temps depuis le lever du soleil (h)",
+     ylab = "Gain d'altitude",
+     main = "Gain d'altitude - Printemps",
+     cex.lab = 1.5, cex.axis = 1.3, cex.main = 1.6,
+     las = 1, font.axis = 2)
+
+# Ajouter les points réels
+for (groupe in groupes) {
+  points(TRACKS_HF_2026_ALT_spring_Z$temps_depuis_sunrise[TRACKS_HF_2026_ALT_spring_Z$age_group == groupe],
+         TRACKS_HF_2026_ALT_spring_Z$alt_gain_30min[TRACKS_HF_2026_ALT_spring_Z$age_group == groupe],
+         pch = 1,
+         col = ifelse(groupe == "juvenile", "deeppink1", "darkgoldenrod1"),
+         cex = 0.5)
+}
+
+# Boucle prédiction + IC
+for (groupe in groupes) {
+  x <- data.frame(
+    temps_depuis_sunrise = heure_seq,
+    age_group = factor(rep(groupe, length(heure_seq)), levels = levels(TRACKS_HF_2026_ALT_spring_Z$age_group))
+  )
+  
+  y <- predict(mod4, newdata = x, se.fit = TRUE)
+  
+  col_main <- ifelse(groupe == "juvenile", "deeppink1", "darkgoldenrod1")
+  col_ci   <- ifelse(groupe == "juvenile", "lightpink", "lightgoldenrod1")
+  
+  lines(x$temps_depuis_sunrise, y$fit, col = col_main, lwd = 2)
+  lines(x$temps_depuis_sunrise, y$fit + 2*y$se.fit, col = col_ci, lty = 2)
+  lines(x$temps_depuis_sunrise, y$fit - 2*y$se.fit, col = col_ci, lty = 2)
+}
+
+legend("topleft", legend = c("Juveniles", "Adultes"),
+       col = c("deeppink1", "darkgoldenrod1"),
+       pch = 1, lwd = 2,
+       title = "Groupe", cex = 1)
+
+abline(v = 0, lty = 2, col = "grey50") # lever du soleil
+
+# -------------------------------
+# AUTOMNE - Descente
+# -------------------------------
+
+mod6 <- lm(alt_gain_30min ~ 1, data = TRACKS_HF_2026_ALT_autumn_Z)
+mod7 <- lm(alt_gain_30min ~ temps_depuis_sunrise, data = TRACKS_HF_2026_ALT_autumn_Z)
+mod8 <- lm(alt_gain_30min ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2), data = TRACKS_HF_2026_ALT_autumn_Z)
+mod9 <- lm(alt_gain_30min ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2) + age_group, data = TRACKS_HF_2026_ALT_autumn_Z)
+mod10 <- lm(alt_gain_30min ~ temps_depuis_sunrise + age_group, data = TRACKS_HF_2026_ALT_autumn_Z)
+
+summary(mod6); summary(mod7); summary(mod8); summary(mod9); summary(mod10)
+AIC(mod6, mod7, mod8, mod9, mod10)
+
+# Modèle choisi
+mod9 <- lm(alt_gain_30min ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2) + age_group, data = TRACKS_HF_2026_ALT_autumn_Z)
+summary(mod9) # OK
+# Axe pour les prédictions
+heure_seq <- seq(
+  min(TRACKS_HF_2026_ALT_autumn_Z$temps_depuis_sunrise, na.rm = TRUE),
+  max(TRACKS_HF_2026_ALT_autumn_Z$temps_depuis_sunrise, na.rm = TRUE),
+  0.1
+)
+
+groupes <- c("juvenile", "adult")
+
+# Graphique vide
+plot(alt_gain_30min ~ temps_depuis_sunrise, type = "n",
+     data = TRACKS_HF_2026_ALT_autumn_Z,
+     xlab = "Temps depuis le lever du soleil (h)",
+     ylab = "Gain d'altitude",
+     main = "Gain d'altitude - Automne",
+     xlim = c(min(heure_seq), max(heure_seq)),
+     cex.lab = 1.5, cex.axis = 1.3, cex.main = 1.6,
+     las = 1, font.axis = 2)
+
+# Ajouter les points réels
+for (groupe in groupes) {
+  points(TRACKS_HF_2026_ALT_autumn_Z$temps_depuis_sunrise[TRACKS_HF_2026_ALT_autumn_Z$age_group == groupe],
+         TRACKS_HF_2026_ALT_autumn_Z$alt_gain_30min[TRACKS_HF_2026_ALT_autumn_Z$age_group == groupe],
+         pch = 1,
+         col = ifelse(groupe == "juvenile", "aquamarine3", "brown"),
+         cex = 0.5)
+}
+
+# Boucle prédiction + IC
+for (groupe in groupes) {
+  x <- data.frame(
+    temps_depuis_sunrise = heure_seq,
+    age_group = factor(rep(groupe, length(heure_seq)), levels = levels(TRACKS_HF_2026_ALT_autumn_Z$age_group))
+  )
+  
+  y <- predict(mod9, newdata = x, se.fit = TRUE)
+  
+  col_main <- ifelse(groupe == "juvenile", "aquamarine3", "brown")
+  col_ci   <- ifelse(groupe == "juvenile", "lightcyan3", "grey80")
+  
+  lines(x$temps_depuis_sunrise, y$fit, col = col_main, lwd = 2)
+  lines(x$temps_depuis_sunrise, y$fit + 2*y$se.fit, col = col_ci, lty = 2)
+  lines(x$temps_depuis_sunrise, y$fit - 2*y$se.fit, col = col_ci, lty = 2)
+}
+
+legend("topleft", legend = c("Juvéniles", "Adultes"),
+       col = c("aquamarine3", "brown"),
+       pch = 1, lwd = 2,
+       title = "Groupe", cex = 1)
+
+abline(v = 0, lty = 2, col = "grey50") # lever du soleil
+
+summary(TRACKS_HF_2026_ALT_autumn_Z$alt_gain_30min)
+
+```
+
+## Hauteur-sol (par sub HF)
+
+```{r}
+#| eval: false
+#| include: false
+# -------------------------------
+# PRINTEMPS - Hauteur sol médiane
+# -------------------------------
+
+# Modèles linéaires / polynomiaux
+modh0 <- lm(height.above.ground_GPS ~ 1, data = TRACKS_HF_2026_HEIGHT_spring_Z)
+modh1 <- lm(height.above.ground_GPS ~ temps_depuis_sunrise, data = TRACKS_HF_2026_HEIGHT_spring_Z)
+modh2 <- lm(height.above.ground_GPS ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2), data = TRACKS_HF_2026_HEIGHT_spring_Z)
+modh3 <- lm(height.above.ground_GPS ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2) + age_group, data = TRACKS_HF_2026_HEIGHT_spring_Z)
+modh4 <- lm(height.above.ground_GPS ~ temps_depuis_sunrise + age_group, data = TRACKS_HF_2026_HEIGHT_spring_Z)
+
+# Résumés et AIC
+summary(modh0); summary(modh1); summary(modh2); summary(modh3); summary(modh4)
+AIC(modh0, modh1, modh2, modh3, modh4)
+
+# Modèle choisi (modh3)
+modh3 <- lm(height.above.ground_GPS ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2) + age_group, data = TRACKS_HF_2026_HEIGHT_spring_Z)
+summary(modh3) # oK
+# Axe pour les prédictions
+heure_seq <- seq(
+  min(TRACKS_HF_2026_HEIGHT_spring_Z$temps_depuis_sunrise, na.rm = TRUE),
+  max(TRACKS_HF_2026_HEIGHT_spring_Z$temps_depuis_sunrise, na.rm = TRUE),
+  0.1
+)
+
+groupes <- c("juvenile", "adult")
+
+# Graphique vide
+par(mfrow=c(1,1))
+plot(height.above.ground_GPS ~ temps_depuis_sunrise, type = "n",
+     data = TRACKS_HF_2026_HEIGHT_spring_Z,
+     xlab = "Temps depuis le lever du soleil (h)",
+     ylab = "Hauteur sol (m)",
+     main = "Hauteur sol - Printemps",
+     cex.lab = 1.5, cex.axis = 1.3, cex.main = 1.6,
+     las = 1, font.axis = 2)
+
+# Ajouter les points réels
+for (groupe in groupes) {
+  points(TRACKS_HF_2026_HEIGHT_spring_Z$temps_depuis_sunrise[TRACKS_HF_2026_HEIGHT_spring_Z$age_group == groupe],
+         TRACKS_HF_2026_HEIGHT_spring_Z$height.above.ground_GPS[TRACKS_HF_2026_HEIGHT_spring_Z$age_group == groupe],
+         pch = 1,
+         col = ifelse(groupe == "juvenile", "deeppink1", "darkgoldenrod1"),
+         cex = 0.5)
+}
+
+# Boucle prédiction + IC
+for (groupe in groupes) {
+  x <- data.frame(
+    temps_depuis_sunrise = heure_seq,
+    age_group = factor(rep(groupe, length(heure_seq)), levels = levels(TRACKS_HF_2026_HEIGHT_spring_Z$age_group))
+  )
+  
+  y <- predict(modh3, newdata = x, se.fit = TRUE)
+  
+  col_main <- ifelse(groupe == "juvenile", "deeppink1", "darkgoldenrod1")
+  col_ci   <- ifelse(groupe == "juvenile", "lightpink", "lightgoldenrod1")
+  
+  lines(x$temps_depuis_sunrise, y$fit, col = col_main, lwd = 2)
+  lines(x$temps_depuis_sunrise, y$fit + 2*y$se.fit, col = col_ci, lty = 2)
+  lines(x$temps_depuis_sunrise, y$fit - 2*y$se.fit, col = col_ci, lty = 2)
+}
+
+legend("topleft", legend = c("Juvéniles", "Adultes"),
+       col = c("deeppink1", "darkgoldenrod1"),
+       pch = 1, lwd = 2,
+       title = "Groupe", cex = 1)
+
+abline(v = 0, lty = 2, col = "grey50") # lever du soleil
+
+# -------------------------------
+# AUTOMNE - Hauteur sol médiane
+# -------------------------------
+
+modh6 <- lm(height.above.ground_GPS ~ 1, data = TRACKS_HF_2026_HEIGHT_autumn_Z)
+modh7 <- lm(height.above.ground_GPS ~ temps_depuis_sunrise, data = TRACKS_HF_2026_HEIGHT_autumn_Z)
+modh8 <- lm(height.above.ground_GPS ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2), data = TRACKS_HF_2026_HEIGHT_autumn_Z)
+modh9 <- lm(height.above.ground_GPS ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2) + age_group, data = TRACKS_HF_2026_HEIGHT_autumn_Z)
+modh10 <- lm(height.above.ground_GPS ~ temps_depuis_sunrise + age_group, data = TRACKS_HF_2026_HEIGHT_autumn_Z)
+
+summary(modh6); summary(modh7); summary(modh8); summary(modh9); summary(modh10)
+AIC(modh6, modh7, modh8, modh9, modh10)
+
+# Modèle choisi
+modh9 <- lm(height.above.ground_GPS ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2) + age_group, data = TRACKS_HF_2026_HEIGHT_autumn_Z)
+summary(modh9)
+
+# Axe pour les prédictions
+heure_seq <- seq(
+  min(TRACKS_HF_2026_HEIGHT_autumn_Z$temps_depuis_sunrise, na.rm = TRUE),
+  max(TRACKS_HF_2026_HEIGHT_autumn_Z$temps_depuis_sunrise, na.rm = TRUE),
+  0.1
+)
+
+# Graphique vide
+par(mfrow=c(1,1))
+plot(height.above.ground_GPS ~ temps_depuis_sunrise, type = "n",
+     data = TRACKS_HF_2026_HEIGHT_autumn_Z,
+     xlab = "Temps depuis le lever du soleil (h)",
+     ylab = "Hauteur sol (m)",
+     main = "Hauteur sol - Automne",
+     xlim = c(min(heure_seq), max(heure_seq)),
+     cex.lab = 1.5, cex.axis = 1.3, cex.main = 1.6,
+     las = 1, font.axis = 2)
+
+# Ajouter les points réels
+for (groupe in groupes) {
+  points(TRACKS_HF_2026_HEIGHT_autumn_Z$temps_depuis_sunrise[TRACKS_HF_2026_HEIGHT_autumn_Z$age_group == groupe],
+         TRACKS_HF_2026_HEIGHT_autumn_Z$height.above.ground_GPS[TRACKS_HF_2026_HEIGHT_autumn_Z$age_group == groupe],
+         pch = 1,
+         col = ifelse(groupe == "juvenile", "aquamarine3", "brown"),
+         cex = 0.5)
+}
+
+# Boucle prédiction + IC
+for (groupe in groupes) {
+  x <- data.frame(
+    temps_depuis_sunrise = heure_seq,
+    age_group = factor(rep(groupe, length(heure_seq)), levels = levels(TRACKS_HF_2026_HEIGHT_autumn_Z$age_group))
+  )
+  
+  y <- predict(modh9, newdata = x, se.fit = TRUE)
+  
+  col_main <- ifelse(groupe == "juvenile", "aquamarine3", "brown")
+  col_ci   <- ifelse(groupe == "juvenile", "lightcyan3", "grey80")
+  
+  lines(x$temps_depuis_sunrise, y$fit, col = col_main, lwd = 2)
+  lines(x$temps_depuis_sunrise, y$fit + 2*y$se.fit, col = col_ci, lty = 2)
+  lines(x$temps_depuis_sunrise, y$fit - 2*y$se.fit, col = col_ci, lty = 2)
+}
+
+legend("topleft", legend = c("Juvéniles", "Adultes"),
+       col = c("aquamarine3", "brown"),
+       pch = 1, lwd = 2,
+       title = "Groupe", cex = 1)
+
+abline(v = 0, lty = 2, col = "grey50") # lever du soleil
+```
+
+## Vitesse GPS médiane : speed_GPS_median
+
+```{r}
+#| eval: false
+#| include: false
+# -------------------------------
+# PRINTEMPS - Vitesse GPS médiane
+# -------------------------------
+
+# Modèles linéaires / polynomiaux
+modv0 <- lm(ground.speed ~ 1, data = TRACKS_HF_2026_SPEED_spring_Z)
+modv1 <- lm(ground.speed ~ temps_depuis_sunrise, data = TRACKS_HF_2026_SPEED_spring_Z)
+modv2 <- lm(ground.speed ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2), data = TRACKS_HF_2026_SPEED_spring_Z)
+modv3 <- lm(ground.speed ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2) + age_group, data = TRACKS_HF_2026_SPEED_spring_Z)
+modv4 <- lm(ground.speed ~ temps_depuis_sunrise + age_group, data = TRACKS_HF_2026_SPEED_spring_Z)
+
+# Résumés et AIC
+summary(modv0); summary(modv1); summary(modv2); summary(modv3); summary(modv4)
+AIC(modv0, modv1, modv2, modv3, modv4)
+
+# Modèle choisi
+modv3 <- lm(ground.speed ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2) + age_group, data = TRACKS_HF_2026_SPEED_spring_Z)
+summary(modv3) # Pas le meilleur AIC mais on souhaite conserver age_group
+
+# Séquence temps pour prédictions
+temps_seq <- seq(
+  min(TRACKS_HF_2026_SPEED_spring_Z$temps_depuis_sunrise, na.rm = TRUE),
+  max(TRACKS_HF_2026_SPEED_spring_Z$temps_depuis_sunrise, na.rm = TRUE),
+  0.1
+)
+
+groupes <- c("juvenile", "adult")
+
+# Graphique vide
+par(mfrow=c(1,1))
+plot(ground.speed ~ temps_depuis_sunrise, data = TRACKS_HF_2026_SPEED_spring_Z, type = "n",
+     xlab = "Temps depuis le lever du soleil (h)",
+     ylab = "Vitesse-sol GPS (km/h)",
+     main = "Vitesse-sol GPS - Printemps",
+     cex.lab = 1.5, cex.axis = 1.3, cex.main = 1.6,
+     las = 1, font.axis = 2)
+
+# Points réels
+for (groupe in groupes) {
+  points(TRACKS_HF_2026_SPEED_spring_Z$temps_depuis_sunrise[TRACKS_HF_2026_SPEED_spring_Z$age_group == groupe],
+         TRACKS_HF_2026_SPEED_spring_Z$ground.speed[TRACKS_HF_2026_SPEED_spring_Z$age_group == groupe],
+         pch = 1,
+         col = ifelse(groupe == "juvenile", "deeppink1", "darkgoldenrod1"),
+         cex = 0.5)
+}
+
+# Boucle prédiction + IC
+for (groupe in groupes) {
+  x <- data.frame(
+    temps_depuis_sunrise = temps_seq,
+    age_group = factor(rep(groupe, length(temps_seq)), levels = levels(TRACKS_HF_2026_SPEED_spring_Z$age_group))
+  )
+  
+  y <- predict(modv3, newdata = x, se.fit = TRUE)
+  
+  col_main <- ifelse(groupe == "juvenile", "deeppink1", "darkgoldenrod1")
+  col_ci   <- ifelse(groupe == "juvenile", "lightpink", "lightgoldenrod1")
+  
+  lines(x$temps_depuis_sunrise, y$fit, col = col_main, lwd = 2)
+  lines(x$temps_depuis_sunrise, y$fit + 2*y$se.fit, col = col_ci, lty = 2)
+  lines(x$temps_depuis_sunrise, y$fit - 2*y$se.fit, col = col_ci, lty = 2)
+}
+
+legend("topleft", legend = c("Juvéniles", "Adultes"),
+       col = c("deeppink1", "darkgoldenrod1"), pch = 1, lwd = 2,
+       title = "Groupe", cex = 1)
+
+abline(v = 0, lty = 2, col = "grey50") # lever du soleil
+
+
+# -------------------------------
+# AUTOMNE - Vitesse GPS médiane
+# -------------------------------
+
+modv5 <- lm(ground.speed ~ 1, data = TRACKS_HF_2026_SPEED_autumn_Z)
+modv6 <- lm(ground.speed ~ temps_depuis_sunrise, data = TRACKS_HF_2026_SPEED_autumn_Z)
+modv7 <- lm(ground.speed ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2), data = TRACKS_HF_2026_SPEED_autumn_Z)
+modv8 <- lm(ground.speed ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2) + age_group, data = TRACKS_HF_2026_SPEED_autumn_Z)
+modv8b <- lm(ground.speed ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2) + age_group + temps_depuis_sunrise:age_group, data = TRACKS_HF_2026_SPEED_autumn_Z)
+modv9 <- lm(ground.speed ~ temps_depuis_sunrise + age_group, data = TRACKS_HF_2026_SPEED_autumn_Z)
+
+summary(modv5); summary(modv6); summary(modv7); summary(modv8); summary(modv8b); summary(modv9)
+AIC(modv5, modv6, modv7, modv8, modv8b, modv9)
+
+# Modèle choisi
+modv8 <- lm(ground.speed ~ temps_depuis_sunrise + I(temps_depuis_sunrise^2) + age_group, data = TRACKS_HF_2026_SPEED_autumn_Z)
+summary(modv8)
+
+# Séquence pour prédiction
+temps_seq <- seq(
+  min(TRACKS_HF_2026_SPEED_autumn_Z$temps_depuis_sunrise, na.rm = TRUE),
+  max(TRACKS_HF_2026_SPEED_autumn_Z$temps_depuis_sunrise, na.rm = TRUE),
+  0.1
+)
+
+groupes <- c("juvenile", "adult")
+
+# Graphique vide
+par(mfrow=c(1,1))
+plot(ground.speed ~ temps_depuis_sunrise, data = TRACKS_HF_2026_SPEED_autumn_Z, type = "n",
+     xlab = "Temps depuis le lever du soleil (h)",
+     ylab = "Vitesse-sol GPS (km/h)",
+     main = "Vitesse-sol GPS - Automne",
+     xlim = c(min(temps_seq), max(temps_seq)),
+     cex.lab = 1.5, cex.axis = 1.3, cex.main = 1.6,
+     las = 1, font.axis = 2)
+
+# Points réels
+cols <- c("aquamarine3", "brown")
+i <- 1
+for (groupe in groupes) {
+  points(TRACKS_HF_2026_SPEED_autumn_Z$temps_depuis_sunrise[TRACKS_HF_2026_SPEED_autumn_Z$age_group == groupe],
+         TRACKS_HF_2026_SPEED_autumn_Z$ground.speed[TRACKS_HF_2026_SPEED_autumn_Z$age_group == groupe],
+         pch = 1, col = cols[i], cex = 0.5)
+  i <- i + 1
+}
+
+# Courbes de prédiction + IC
+i <- 1
+for (groupe in groupes) {
+  x <- data.frame(
+    temps_depuis_sunrise = temps_seq,
+    age_group = factor(rep(groupe, length(temps_seq)), levels = groupes)
+  )
+  y <- predict(modv8b, newdata = x, se.fit = TRUE)
+  
+  lines(temps_seq, y$fit, col = cols[i], lwd = 2)
+  lines(temps_seq, y$fit + 2*y$se.fit, col = cols[i], lty = 2)
+  lines(temps_seq, y$fit - 2*y$se.fit, col = cols[i], lty = 2)
+  i <- i + 1
+}
+
+legend("topleft", legend = groupes, col = cols, pch = 1, lwd = 2)
+abline(v = 0, lty = 2, col = "grey50") # lever du soleil
+```

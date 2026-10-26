@@ -1,0 +1,2292 @@
+---
+title: "Trajectoire spatiale"
+author: "Alice Rodrigues"
+format: pdf
+execute:
+  echo: true    # Affiche le code (false pour cacher)
+  warning: false  # Cache les warnings
+editor: visual
+---
+
+# Libraries
+
+```{r}
+library(here)
+library(sf)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)  
+
+library(rnaturalearth)
+library(ggpubr)
+
+```
+
+# Chargement des données
+
+```{r}
+load(here("Alice/STE_data_preparation_February_2026/2.Data_preparation/2.1_OUTPUT_STE_France_processed_all_A2026-02-24.RData")) # Point par point HF + BF
+DATA_ALL <- data
+
+# HF et BF : 1 ligne = 1 point toute les 5min
+load(here("Alice/STE_data_preparation_February_2026/2.Data_preparation/2.1_OUTPUT_STE_France_processed_sub5_A2026-03-03.RData"))
+# data_sub5
+# DATA_ALL <- data_sub5 # Pour tester
+
+# Données HF Ornitela
+load(here("Alice/STE_data_preparation_February_2026/2.Data_preparation/2.1_OUTPUT_STE_France_processed_HF_A2026-02-24.RData"))  # Point par point HF
+```
+
+# Prétraitements classiques
+
+## Colonnes utiles
+
+```{r}
+#CréATION variable age simplifiée (age_CY : "adult" ou numéros = juveniles)
+DATA_ALL <- DATA_ALL %>%
+  mutate(
+    age_group = case_when(
+      age_CY == "adult" ~ "adult",
+      !is.na(age_CY) & age_CY != "adult" ~ "juvenile",
+      TRUE ~ NA_character_
+    )
+  )
+table(DATA_ALL$age_group, useNA = "ifany") 
+
+
+# ADD column "MIGRATION" spring / autumn
+DATA_ALL$date <- as.Date(DATA_ALL$timestamp)
+DATA_ALL$date <- as.Date(DATA_ALL$date)
+#DATA_ALL$date
+
+DATA_ALL <- DATA_ALL %>%
+  mutate(
+    MIGRATION = case_when(
+      month(date) %in% 1:7  ~ "spring",
+      month(date) %in% 8:12 ~ "autumn",
+      TRUE ~ NA_character_
+    )
+  )
+
+
+# data_sub5
+#CréATION variable age simplifiée (age_CY : "adult" ou numéros = juveniles)
+data_sub5 <- data_sub5 %>%
+  mutate(
+    age_group = case_when(
+      age_CY == "adult" ~ "adult",
+      !is.na(age_CY) & age_CY != "adult" ~ "juvenile",
+      TRUE ~ NA_character_
+    )
+  )
+table(data_sub5$age_group, useNA = "ifany") 
+
+
+# ADD column "MIGRATION" spring / autumn
+data_sub5$date <- as.Date(data_sub5$timestamp)
+data_sub5$date <- as.Date(data_sub5$date)
+#data_sub5$date
+
+data_sub5 <- data_sub5 %>%
+  mutate(
+    MIGRATION = case_when(
+      month(date) %in% 1:7  ~ "spring",
+      month(date) %in% 8:12 ~ "autumn",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+## Délimitation de la zone
+
+```{r}
+# Création de la  zone_interet
+ecoregions <- st_read(here( "Alice/Data_analysis/Ecoregions2017/Ecoregions2017.shp"), wkt_filter = st_as_text( st_as_sfc(st_bbox(c( xmin = -20, xmax = 60, ymin = 0, ymax = 40 ), crs = 4326)) ) ) 
+names(ecoregions) 
+#unique(ecoregions$BIOME_NAME)
+#unique(ecoregions$ECO_NAME)
+
+desert <- ecoregions[ecoregions$BIOME_NAME == "Deserts & Xeric Shrublands", ] 
+plot(desert["BIOME_NAME"])
+
+sahara <- ecoregions[grepl("Sahara", ecoregions$ECO_NAME), ] 
+plot(sahara["BIOME_NAME"])
+
+tibesti_sahara <- ecoregions[grepl("Sahara|Tibesti-Jebel Uweinat", ecoregions$ECO_NAME), ] 
+plot(tibesti_sahara["BIOME_NAME"])
+
+pts_sf <- st_as_sf(DATA_ALL, coords = c("location.long", "location.lat"), crs = 4326)
+
+coords <- st_coordinates(pts_sf)
+# coords[,1] = longitude, coords[,2] = latitude
+lat <- coords[,2]
+intersects_vec <- apply(st_intersects(pts_sf, tibesti_sahara, sparse = FALSE), 1, any)
+
+pts_sf$Zone_interet <- ifelse(
+  (lat >= 17.51 & lat <= 26.0) | intersects_vec,
+  "Zone_interet",
+  NA
+)
+unique(pts_sf$Zone_interet)
+# Check
+tab <- table(pts_sf$Zone_interet, useNA = "ifany")
+# proportion
+prop <- tab / sum(tab) * 100
+prop
+# Add Zone_interet to data
+DATA_ALL$Zone_interet <- pts_sf$Zone_interet
+unique(DATA_ALL$Zone_interet)
+
+
+# Jeu de donnée séparé
+
+#Mise en facteur
+DATA_ALL <- DATA_ALL %>%
+  mutate(across(c(
+    Zone_interet, age_group, individual.local.identifier, MIGRATION
+  ), as.factor))
+table(DATA_ALL$Zone_interet)
+
+# Séléction Zone_interet
+DATA_ALL <- DATA_ALL %>%
+  filter(!is.na(Zone_interet))
+unique(DATA_ALL$Zone_interet)
+```
+
+# Préparation du jdd coordonnées
+
+## Alignement des coordonnées
+
+```{r}
+DATA_sf <- st_as_sf(DATA_ALL, coords = c("location.long", "location.lat"), crs = 4326)
+DATA_proj <- st_transform(DATA_sf, crs = 3857)  # ou UTM adapté
+
+# Aligner les coordonnées
+coords <- st_coordinates(DATA_proj)
+
+DATA_ALL$x <- coords[,1]
+DATA_ALL$y <- coords[,2]
+
+```
+
+## Base comparable de trajectoire
+
+```{r}
+# Projection métrique et normalisation
+DATA_ALL <- DATA_ALL %>%
+  group_by(bird_year) %>%
+  arrange(timestamp) %>%
+  mutate(
+    dist_cum = cumsum(replace_na(ddist_2D, 0)),
+    dist_norm = dist_cum / max(dist_cum)
+  )
+```
+
+## Interpolations
+
+```{r}
+
+# Interpoler les trajectoires sur une grille commune
+grid <- seq(0, 1, length.out = 100)
+
+interp_traj <- function(df) {
+  data.frame(
+    dist_norm = grid,
+    x = approx(df$dist_norm, df$x, xout = grid, rule = 2)$y,
+    y = approx(df$dist_norm, df$y, xout = grid, rule = 2)$y
+  )
+}
+
+# Créer la liste de trajectoires par individu + saison
+traj_list <- DATA_ALL %>%
+  filter(!is.na(MIGRATION), !is.na(age_group)) %>%
+  group_by(individual.local.identifier, MIGRATION, bird_year) %>%
+  group_split()
+
+# Interpoler toutes les trajectoires
+traj_list_interp <- lapply(traj_list, interp_traj)
+
+# Calculer la distance moyenne entre les migrations d'un même individu
+traj_dist <- function(t1, t2) {
+  mean(sqrt((t1$x - t2$x)^2 + (t1$y - t2$y)^2))
+}
+
+pairwise_dist <- function(trajs) {
+  if(length(trajs) < 2) return(NA)
+  combn(seq_along(trajs), 2, function(idx) {
+    traj_dist(trajs[[idx[1]]], trajs[[idx[2]]])
+  }) %>% mean(na.rm = TRUE)
+}
+```
+
+## Visualisation des anomalies
+
+```{r}
+#| eval: false
+#| include: false
+# Retrait de Charline
+# Demi-tour au Nord de l'Algérie à : 2025-05-10 15:00
+# Mais pause avant, vers 13h. Donc on coupe à 2025-05-10 13:00
+# Départ migration automne 2025 2025-09-24 10:00
+# => Donc estivage de 2025-05-10 13:00 à 2025 2025-09-24 10:00
+
+
+# verif 1 : Charline
+start_time <- as.POSIXct("2025-05-10 13:00:00", tz = "UTC")
+end_time   <- as.POSIXct("2025-09-24 10:00:00", tz = "UTC")
+data_verif <- DATA_ALL %>%
+  filter(
+    timestamp >= start_time &
+    timestamp <= end_time
+  )
+
+ggplot(data_verif, aes(x = x, y = y, group = individual.local.identifier, color = age_group)) +
+  geom_path(alpha = 0.6, linewidth = 0.5) +
+  coord_equal(expand = FALSE) +
+  scale_color_manual(values = c(
+    "juvenile" = "darkorange1",
+    "adult" = "darkorchid2"   
+  )) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+
+# verif 2 : Mina
+data_verif2 <- DATA_ALL %>%
+  filter(
+    country == "Tunisia"
+  )
+
+ggplot(data_verif2, aes(x = x, y = y, group = individual.local.identifier, color = age_group)) +
+  geom_path(alpha = 0.6, linewidth = 0.5) +
+  coord_equal(expand = FALSE) +
+  scale_color_manual(values = c(
+    "juvenile" = "darkorange1",
+    "adult" = "darkorchid2"    
+  )) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+# => C'est Mina de Rians en Tunisie spring 2023
+```
+
+## Découpe et jdd par saison et age_group
+
+```{r}
+
+# Découpe des anomalies DATA_ALL
+
+# Charline
+start_time <- as.POSIXct("2025-05-10 13:00:00", tz = "UTC")
+end_time   <- as.POSIXct("2025-09-24 10:00:00", tz = "UTC")
+DATA_ALL <- DATA_ALL[
+  !(
+    DATA_ALL$timestamp >= start_time &
+    DATA_ALL$timestamp <= end_time &
+    DATA_ALL$individual.local.identifier == "Charline de la Grisonnière"
+  ),
+]
+# Mina
+DATA_ALL <- DATA_ALL[
+  !(
+    DATA_ALL$country == "Tunisia" &
+    DATA_ALL$individual.local.identifier == "Mina de Rians"
+  ),
+]
+
+# Par saison
+DATA_ALL_spring <- DATA_ALL %>%
+  filter(MIGRATION == "spring")
+DATA_ALL_autumn <- DATA_ALL %>%
+  filter(MIGRATION == "autumn")
+
+# Par age_group
+#Juvenile
+DATA_ALL_spring_juv <- DATA_ALL_spring %>%
+  filter(age_group == "juvenile")
+DATA_ALL_autumn_juv <- DATA_ALL_autumn %>%
+  filter(age_group == "juvenile")
+# Adult
+DATA_ALL_spring_ad <- DATA_ALL_spring %>%
+  filter(age_group == "adult")
+DATA_ALL_autumn_ad <- DATA_ALL_autumn %>%
+  filter(age_group == "adult")
+```
+
+## Gestion des écarts pour geom_path
+
+```{r}
+DATA_ALL <- DATA_ALL %>%
+  mutate(year = format(timestamp, "%Y")) # colonne year
+DATA_ALL$year
+unique(DATA_ALL$year[DATA_ALL$individual.local.identifier == "Charline de la Grisonnière"]) # "2024" "2025"
+unique(DATA_ALL$year[DATA_ALL$individual.local.identifier == "Mina de Rians"]) # "2023" "2024" "2025"
+
+# DATA_ALL
+DATA_ALL <- DATA_ALL %>%
+  group_by(individual.local.identifier) %>%
+  arrange(timestamp) %>%
+  mutate(
+    year = format(timestamp, "%Y"),
+    dt = as.numeric(difftime(timestamp, lag(timestamp), units = "days")),
+    break_segment = ifelse(is.na(dt) | dt > 20, 1, 0),
+    segment_id = cumsum(break_segment)
+  ) %>%
+  ungroup()
+
+# data_sub5
+data_sub5 <- data_sub5 %>%
+  group_by(individual.local.identifier) %>%
+  arrange(timestamp) %>%
+  mutate(
+    year = format(timestamp, "%Y"),
+    dt = as.numeric(difftime(timestamp, lag(timestamp), units = "days")),
+    break_segment = ifelse(is.na(dt) | dt > 20, 1, 0),
+    segment_id = cumsum(break_segment)
+  ) %>%
+  ungroup()
+
+# DATA_ALL_spring
+DATA_ALL_spring <- DATA_ALL_spring %>%
+  arrange(individual.local.identifier, timestamp) %>%
+  group_by(individual.local.identifier) %>%
+  mutate(
+    dt = as.numeric(difftime(timestamp, lag(timestamp), units = "days")),
+    break_segment = ifelse(is.na(dt) | dt > 20, 1, 0),
+    segment_id = cumsum(break_segment)
+  ) %>%
+  ungroup()
+
+# DATA_ALL_autumn
+DATA_ALL_autumn <- DATA_ALL_autumn %>%
+  arrange(individual.local.identifier, timestamp) %>%
+  group_by(individual.local.identifier) %>%
+  mutate(
+    dt = as.numeric(difftime(timestamp, lag(timestamp), units = "days")),
+    break_segment = ifelse(is.na(dt) | dt > 20, 1, 0),
+    segment_id = cumsum(break_segment)
+  ) %>%
+  ungroup()
+
+# DATA_ALL_spring_juv
+DATA_ALL_spring_juv <- DATA_ALL_spring_juv %>%
+  arrange(individual.local.identifier, timestamp) %>%
+  group_by(individual.local.identifier) %>%
+  mutate(
+    dt = as.numeric(difftime(timestamp, lag(timestamp), units = "days")),
+    break_segment = ifelse(is.na(dt) | dt > 20, 1, 0),
+    segment_id = cumsum(break_segment)
+  ) %>%
+  ungroup()
+
+# DATA_ALL_autumn_juv
+DATA_ALL_autumn_juv <- DATA_ALL_autumn_juv %>%
+  arrange(individual.local.identifier, timestamp) %>%
+  group_by(individual.local.identifier) %>%
+  mutate(
+    dt = as.numeric(difftime(timestamp, lag(timestamp), units = "days")),
+    break_segment = ifelse(is.na(dt) | dt > 20, 1, 0),
+    segment_id = cumsum(break_segment)
+  ) %>%
+  ungroup()
+
+
+# DATA_ALL_spring_ad
+DATA_ALL_spring_ad <- DATA_ALL_spring_ad %>%
+  arrange(individual.local.identifier, timestamp) %>%
+  group_by(individual.local.identifier) %>%
+  mutate(
+    dt = as.numeric(difftime(timestamp, lag(timestamp), units = "days")),
+    break_segment = ifelse(is.na(dt) | dt > 20, 1, 0),
+    segment_id = cumsum(break_segment)
+  ) %>%
+  ungroup()
+
+# DATA_ALL_autumn_ad
+DATA_ALL_autumn_ad <- DATA_ALL_autumn_ad %>%
+  arrange(individual.local.identifier, timestamp) %>%
+  group_by(individual.local.identifier) %>%
+  mutate(
+    dt = as.numeric(difftime(timestamp, lag(timestamp), units = "days")),
+    break_segment = ifelse(is.na(dt) | dt > 20, 1, 0),
+    segment_id = cumsum(break_segment)
+  ) %>%
+  ungroup()
+
+
+# verif
+DATA_ALL_spring <- DATA_ALL_spring %>%
+  mutate(year = format(timestamp, "%Y")) # colonne year
+DATA_ALL_autumn <- DATA_ALL_autumn %>%
+  mutate(year = format(timestamp, "%Y")) # colonne year
+unique(DATA_ALL_spring$year[DATA_ALL_spring$individual.local.identifier == "Charline de la Grisonnière"]) # "2025"
+unique(DATA_ALL_autumn$year[DATA_ALL_autumn$individual.local.identifier == "Charline de la Grisonnière"]) # "2024" "2025"
+unique(DATA_ALL_spring$year[DATA_ALL_spring$individual.local.identifier == "Mina de Rians"]) # "2024" "2025"
+unique(DATA_ALL_autumn$year[DATA_ALL_autumn$individual.local.identifier == "Mina de Rians"]) # "2023" "2024"
+
+```
+
+## Identification des pauses
+
+```{r}
+# Placement des sites sans mouvement "sit"
+# move_2 : Bird in flight or perched v2 (determined using ground speed thresholds plus assigning all HF positions > 50 m a.g.l. as in-flight): "move" or "sit"
+
+# DATA_ALL
+# Séquences de "sit" pour les vraies pauses
+DATA_ALL <- DATA_ALL %>%
+  arrange(individual.local.identifier, timestamp) %>%
+  group_by(individual.local.identifier) %>%
+  mutate(
+    is_sit = move_2 == "sit",
+    sit_block = cumsum(is_sit != lag(is_sit, default = first(is_sit)))
+  ) %>%
+  ungroup()
+# Calculer la durée de chaque bloc de sit
+sit_summary <- DATA_ALL %>%
+  filter(is_sit) %>%
+  group_by(individual.local.identifier, sit_block, daynight_0) %>%
+  summarise(
+    duration_min = as.numeric(difftime(max(timestamp), min(timestamp), units = "mins")),
+    .groups = "drop"
+  )
+# Grader que les blocs > 10min
+valid_sit <- sit_summary %>%
+  filter(duration_min >= 10)
+# Récupérer les points corréspondants
+DATA_sit_long_all <- DATA_ALL %>%
+  inner_join(valid_sit,
+             by = c("individual.local.identifier", "sit_block"))
+
+#### Comptage
+valid_sit %>%
+  filter(daynight_0 == "day") %>%
+  distinct(individual.local.identifier, sit_block) %>%
+  count(individual.local.identifier)
+
+
+# DATA_ALL_spring
+# Séquences de "sit" pour les vraies pauses
+DATA_ALL_spring <- DATA_ALL_spring %>%
+  arrange(individual.local.identifier, timestamp) %>%
+  group_by(individual.local.identifier) %>%
+  mutate(
+    is_sit = move_2 == "sit",
+    sit_block = cumsum(is_sit != lag(is_sit, default = first(is_sit)))
+  ) %>%
+  ungroup()
+# Calculer la durée de chaque bloc de sit
+sit_summary <- DATA_ALL_spring %>%
+  filter(is_sit) %>%
+  group_by(individual.local.identifier, sit_block) %>%
+  summarise(
+    duration_min = as.numeric(difftime(max(timestamp), min(timestamp), units = "mins")),
+    .groups = "drop"
+  )
+# Grader que les blocs > 10min
+valid_sit <- sit_summary %>%
+  filter(duration_min >= 10)
+# Récupérer les points corréspondants
+DATA_sit_long_spring <- DATA_ALL_spring %>%
+  inner_join(valid_sit,
+             by = c("individual.local.identifier", "sit_block"))
+
+# DATA_ALL_autumn
+# Séquences de "sit" pour les vraies pauses
+DATA_ALL_autumn <- DATA_ALL_autumn %>%
+  arrange(individual.local.identifier, timestamp) %>%
+  group_by(individual.local.identifier) %>%
+  mutate(
+    is_sit = move_2 == "sit",
+    sit_block = cumsum(is_sit != lag(is_sit, default = first(is_sit)))
+  ) %>%
+  ungroup()
+# Calculer la durée de chaque bloc de sit
+sit_summary <- DATA_ALL_autumn %>%
+  filter(is_sit) %>%
+  group_by(individual.local.identifier, sit_block) %>%
+  summarise(
+    duration_min = as.numeric(difftime(max(timestamp), min(timestamp), units = "mins")),
+    .groups = "drop"
+  )
+# Grader que les blocs > 10min
+valid_sit <- sit_summary %>%
+  filter(duration_min >= 10)
+# Récupérer les points corréspondants
+DATA_sit_long_autumn <- DATA_ALL_autumn %>%
+  inner_join(valid_sit,
+             by = c("individual.local.identifier", "sit_block"))
+
+# DATA_ALL_spring_juv
+# Séquences de "sit" pour les vraies pauses
+DATA_ALL_spring_juv <- DATA_ALL_spring_juv %>%
+  arrange(individual.local.identifier, timestamp) %>%
+  group_by(individual.local.identifier) %>%
+  mutate(
+    is_sit = move_2 == "sit",
+    sit_block = cumsum(is_sit != lag(is_sit, default = first(is_sit)))
+  ) %>%
+  ungroup()
+# Calculer la durée de chaque bloc de sit
+sit_summary <- DATA_ALL_spring_juv %>%
+  filter(is_sit) %>%
+  group_by(individual.local.identifier, sit_block) %>%
+  summarise(
+    duration_min = as.numeric(difftime(max(timestamp), min(timestamp), units = "mins")),
+    .groups = "drop"
+  )
+# Grader que les blocs > 10min
+valid_sit <- sit_summary %>%
+  filter(duration_min >= 10)
+# Récupérer les points corréspondants
+DATA_sit_long_spring_juv <- DATA_ALL_spring_juv %>%
+  inner_join(valid_sit,
+             by = c("individual.local.identifier", "sit_block"))
+
+# DATA_ALL_autumn_juv
+# Séquences de "sit" pour les vraies pauses
+DATA_ALL_autumn_juv <- DATA_ALL_autumn_juv %>%
+  arrange(individual.local.identifier, timestamp) %>%
+  group_by(individual.local.identifier) %>%
+  mutate(
+    is_sit = move_2 == "sit",
+    sit_block = cumsum(is_sit != lag(is_sit, default = first(is_sit)))
+  ) %>%
+  ungroup()
+# Calculer la durée de chaque bloc de sit
+sit_summary <- DATA_ALL_autumn_juv %>%
+  filter(is_sit) %>%
+  group_by(individual.local.identifier, sit_block) %>%
+  summarise(
+    duration_min = as.numeric(difftime(max(timestamp), min(timestamp), units = "mins")),
+    .groups = "drop"
+  )
+# Grader que les blocs > 10min
+valid_sit <- sit_summary %>%
+  filter(duration_min >= 10)
+# Récupérer les points corréspondants
+DATA_sit_long_autumn_juv <- DATA_ALL_autumn_juv %>%
+  inner_join(valid_sit,
+             by = c("individual.local.identifier", "sit_block"))
+
+# DATA_ALL_spring_ad
+# Séquences de "sit" pour les vraies pauses
+DATA_ALL_spring_ad <- DATA_ALL_spring_ad %>%
+  arrange(individual.local.identifier, timestamp) %>%
+  group_by(individual.local.identifier) %>%
+  mutate(
+    is_sit = move_2 == "sit",
+    sit_block = cumsum(is_sit != lag(is_sit, default = first(is_sit)))
+  ) %>%
+  ungroup()
+# Calculer la durée de chaque bloc de sit
+sit_summary <- DATA_ALL_spring_ad %>%
+  filter(is_sit) %>%
+  group_by(individual.local.identifier, sit_block) %>%
+  summarise(
+    duration_min = as.numeric(difftime(max(timestamp), min(timestamp), units = "mins")),
+    .groups = "drop"
+  )
+# Grader que les blocs > 10min
+valid_sit <- sit_summary %>%
+  filter(duration_min >= 10)
+# Récupérer les points corréspondants
+DATA_sit_long_spring_ad <- DATA_ALL_spring_ad %>%
+  inner_join(valid_sit,
+             by = c("individual.local.identifier", "sit_block"))
+
+# DATA_ALL_autumn_ad
+# Séquences de "sit" pour les vraies pauses
+DATA_ALL_autumn_ad <- DATA_ALL_autumn_ad %>%
+  arrange(individual.local.identifier, timestamp) %>%
+  group_by(individual.local.identifier) %>%
+  mutate(
+    is_sit = move_2 == "sit",
+    sit_block = cumsum(is_sit != lag(is_sit, default = first(is_sit)))
+  ) %>%
+  ungroup()
+# Calculer la durée de chaque bloc de sit
+sit_summary <- DATA_ALL_autumn_ad %>%
+  filter(is_sit) %>%
+  group_by(individual.local.identifier, sit_block) %>%
+  summarise(
+    duration_min = as.numeric(difftime(max(timestamp), min(timestamp), units = "mins")),
+    .groups = "drop"
+  )
+# Grader que les blocs > 10min
+valid_sit <- sit_summary %>%
+  filter(duration_min >= 10)
+# Récupérer les points corréspondants
+DATA_sit_long_autumn_ad <- DATA_ALL_autumn_ad %>%
+  inner_join(valid_sit,
+             by = c("individual.local.identifier", "sit_block"))
+```
+
+# Trajectoires par saison
+
+## Spring + autumn
+
+```{r}
+# Plot des pauses sur les trajectoires
+ggplot(DATA_ALL,
+       aes(x = x, y = y,
+           group = interaction(individual.local.identifier, segment_id),
+           color = age_group)) +
+  
+  geom_path(alpha = 0.6, linewidth = 0.5) +
+  
+  geom_point(
+    data = DATA_sit_long_all,
+    aes(x = x, y = y),
+    inherit.aes = FALSE,
+    color = "cornflowerblue",
+    size = 1.2
+  ) +
+  
+  coord_equal(expand = FALSE) +
+  
+  scale_color_manual(values = c(
+    "juvenile" = "darkorange1",
+    "adult" = "darkorchid2"
+  )) +
+  
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+
+
+# Points de nuit : Inconvéniant, peut inclure un début ou une fin de vol, seulement en fonction de la position du soleil
+ggplot(DATA_ALL,
+       aes(x = x, y = y,
+           group = interaction(individual.local.identifier, segment_id),
+           color = age_group)) +
+  
+  geom_path(alpha = 0.6, linewidth = 0.5) +
+  
+  geom_point(
+    data = subset(DATA_ALL, daynight_0 == "night"),
+    aes(x = x, y = y),
+    inherit.aes = FALSE,
+    color = "black",
+    size = 1.2
+  ) +
+  
+  coord_equal(expand = FALSE) +
+  
+  scale_color_manual(values = c(
+    "juvenile" = "darkorange1",
+    "adult" = "darkorchid2"
+  )) +
+  
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+
+
+
+### Superposition
+ggplot(DATA_ALL, aes(x = x, y = y)) +
+
+  # DENSITÉ
+  stat_density_2d(
+    aes(fill = after_stat(level)),
+    geom = "polygon",
+    alpha = 0.3,
+    contour = TRUE
+  ) +
+  
+  scale_fill_gradient(low = "white", high = "red", name = "Densité") +
+  
+  # Trajectoires
+  geom_path(
+    aes(group = interaction(individual.local.identifier, segment_id),
+        color = age_group),
+    alpha = 0.6,
+    linewidth = 0.4
+  ) +
+  
+  # SIT
+  geom_point(
+    data = DATA_sit_long_all,
+    aes(x = x, y = y, shape = "stop"),
+    color = "cornflowerblue",
+    size = 1.5
+  ) +
+  
+  # Nuit
+  geom_point(
+    data = subset(DATA_ALL, daynight_0 == "night"),
+    aes(x = x, y = y, shape = "night"),
+    color = "black",
+    size = 1,
+    alpha = 0.6
+  ) +
+  
+  coord_equal(expand = FALSE) +
+  
+  scale_color_manual(
+    values = c(
+      "juvenile" = "darkorange1",
+      "adult" = "darkorchid2"
+    ),
+    name = "Age"
+  ) +
+  
+  scale_shape_manual(
+    values = c("stop" = 18, "night" = 19),
+    name = "Stops"
+  ) +
+  
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+```
+
+## Spring
+
+```{r}
+# Points de nuit
+ggplot(DATA_ALL_spring,
+       aes(x = x, y = y,
+           group = interaction(individual.local.identifier, segment_id),
+           color = age_group)) +
+  
+  geom_path(alpha = 0.6, linewidth = 0.5) +
+  
+  geom_point(
+    data = subset(DATA_ALL_spring, daynight_0 == "night"),
+    aes(x = x, y = y),
+    inherit.aes = FALSE,
+    color = "black",
+    size = 1.2
+  ) +
+  
+  coord_equal(expand = FALSE) +
+  
+  scale_color_manual(values = c(
+    "juvenile" = "#E63973",
+    "adult" = "#F77F00"
+  )) +
+  
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+
+
+
+### Superposition
+ggplot(DATA_ALL_spring, aes(x = x, y = y)) +
+
+  # DENSITÉ
+  stat_density_2d(
+    aes(fill = after_stat(level)),
+    geom = "polygon",
+    alpha = 0.3,
+    contour = TRUE
+  ) +
+  
+  scale_fill_gradient(low = "white", high = "red", name = "Densité") +
+  
+  # Trajectoires
+  geom_path(
+    aes(group = interaction(individual.local.identifier, segment_id),
+        color = age_group),
+    alpha = 0.6,
+    linewidth = 0.4
+  ) +
+  
+  # SIT
+  geom_point(
+    data = DATA_sit_long_spring,
+    aes(x = x, y = y, shape = "stop"),
+    color = "cornflowerblue",
+    size = 1.5
+  ) +
+  
+  # Nuit
+  geom_point(
+    data = subset(DATA_ALL_spring, daynight_0 == "night"),
+    aes(x = x, y = y, shape = "night"),
+    color = "black",
+    size = 1,
+    alpha = 0.6
+  ) +
+  
+  coord_equal(expand = FALSE) +
+  
+  scale_color_manual(
+    values = c(
+    "juvenile" = "#E63973",
+    "adult" = "#F77F00"
+    ),
+    name = "Age"
+  ) +
+  
+  scale_shape_manual(
+    values = c("stop" = 18, "night" = 19),
+    name = "Stops"
+  ) +
+  
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+
+
+##### Carte avec biome : Tout est converti en sf
+
+# Tout convertir en sf propre
+pts_sf <- st_as_sf(
+  DATA_ALL_spring,
+  coords = c("location.long", "location.lat"),
+  crs = 4326
+)
+sit_sf <- st_as_sf(
+  DATA_sit_long_spring,
+  coords = c("location.long", "location.lat"),
+  crs = 4326
+)
+
+# Age_group
+pts_sf <- pts_sf %>%
+  mutate(
+    age_group = case_when(
+      age_CY == "adult" ~ "adult",
+      !is.na(age_CY) & age_CY != "adult" ~ "juvenile",
+      TRUE ~ NA_character_
+    )
+  )
+
+
+# Trajectoires en sf
+lines_sf <- pts_sf %>%
+  arrange(individual.local.identifier, timestamp) %>%   # adapter si besoin
+  group_by(individual.local.identifier, segment_id) %>%
+  summarise(do_union = FALSE) %>%
+  st_cast("LINESTRING")
+str(lines_sf)
+
+
+# DENSITÉ (remplacement de stat_density_2d)
+
+# Grille : kernel density raster
+library(MASS)
+coords <- st_coordinates(pts_sf)
+k <- kde2d(coords[,1], coords[,2], n = 200)
+
+# transformer en raster sf-compatible
+library(terra)
+r <- rast(k)
+crs(r) <- st_crs(pts_sf)$wkt
+
+# convertir en sf pour ggplot
+dens_sf <- as.data.frame(r, xy = TRUE)
+names(dens_sf) <- c("x", "y", "density")
+
+
+
+## Coupe et plot
+
+tibesti_sahara_proj <- st_transform(tibesti_sahara_proj, 4326)
+
+# Coupe
+cut_line <- st_sfc(
+  st_linestring(matrix(
+    c(10, -90,
+      10,  90),
+    ncol = 2,
+    byrow = TRUE
+  )),
+  crs = 4326
+)
+cut_line <- st_buffer(cut_line, 0)
+zone_west <- st_difference(
+  tibesti_sahara_proj,
+  st_sfc(
+    st_polygon(list(matrix(
+      c(10, -90,
+        180, -90,
+        180, 90,
+        10, 90,
+        10, -90),
+      ncol = 2,
+      byrow = TRUE
+    ))),
+    crs = 4326
+  )
+)
+plot(st_geometry(zone_west)) # Vérif
+
+# Plot
+ggplot() +
+
+  # zone tronquée
+  geom_sf(
+    data = zone_west,
+    fill = NA,
+    color = "azure2",
+    linewidth = 0.8
+  ) +
+
+  # densité
+  geom_raster(
+    data = dens_sf,
+    aes(x = x, y = y, fill = density),
+    alpha = 0.4
+  ) +
+
+  scale_fill_gradient(low = "white", high = "red", name = "Densité") +
+
+  # trajectoires
+  geom_sf(
+    data = lines_sf,
+    aes(color = individual.local.identifier),
+    alpha = 0.6,
+    linewidth = 0.4
+  ) +
+
+  # SIT
+  geom_sf(
+    data = sit_sf,
+    shape = 18,
+    color = "cornflowerblue",
+    size = 1.5
+  ) +
+
+  # nuit
+  geom_sf(
+  data = pts_sf,
+  aes(shape = daynight_0),
+  color = "black",
+  size = 1,
+  alpha = 0.6
+) +
+
+  coord_sf() +
+  
+  
+  # Légende stops
+  scale_shape_manual(
+  values = c("sit" = 18, "night" = 19),
+  name = "Stops"
+) +
+
+  theme_minimal()
+
+
+
+#### Avec toutes les régions
+
+sf::sf_use_s2(FALSE)
+
+plot_sahara <- st_make_valid(st_transform(ecoregions, 4326))
+
+window_mask <- st_sfc(
+  st_polygon(list(matrix(
+    c(-180, 15,
+      10, 15,
+      10, 35,
+      -180, 35,
+      -180, 15),
+    ncol = 2,
+    byrow = TRUE
+  ))),
+  crs = 4326
+)
+
+plot_sahara <- st_make_valid(st_transform(ecoregions, 4326))
+window_mask <- st_make_valid(window_mask)
+
+zone_crop <- st_intersection(plot_sahara, window_mask)
+
+
+
+
+# Plot
+ggplot() +
+
+  # zone tronquée
+  geom_sf(
+    data = zone_crop,
+    fill = NA,
+    color = "azure2",
+    linewidth = 0.8
+  ) +
+
+  # densité
+  geom_raster(
+    data = dens_sf,
+    aes(x = x, y = y, fill = density),
+    alpha = 0.4
+  ) +
+
+  scale_fill_gradient(low = "white", high = "red", name = "Densité") +
+
+  # trajectoires
+  geom_sf(
+    data = lines_sf,
+    aes(color = individual.local.identifier),
+    alpha = 0.6,
+    linewidth = 0.4
+  ) +
+
+  # SIT
+  geom_sf(
+    data = sit_sf,
+    shape = 18,
+    color = "cornflowerblue",
+    size = 1.5
+  ) +
+
+  # nuit
+  geom_sf(
+    data = subset(pts_sf, daynight_0 == "night"),
+    color = "black",
+    size = 1,
+    alpha = 0.6
+  ) +
+
+  coord_sf() +
+
+  theme_minimal()
+```
+
+## Autumn
+
+```{r}
+# Points de nuit
+ggplot(DATA_ALL_autumn, aes(x = x, y = y,
+                            group = interaction(individual.local.identifier, segment_id),
+                            color = age_group)) +
+  geom_path(alpha = 0.6, linewidth = 0.5) +
+  
+  geom_point(
+    data = subset(DATA_ALL_autumn, daynight_0 == "night"),
+    aes(x = x, y = y),
+    inherit.aes = FALSE,
+    color = "black",
+    size = 1.2
+  ) +
+  
+  coord_equal(expand = FALSE) +
+  scale_color_manual(values = c(
+    "juvenile" = "aquamarine3",  
+    "adult" = "brown"
+  )) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+# Supperposition point de nuit et pauses
+### Superposition
+ggplot(DATA_ALL_autumn, aes(x = x, y = y)) +
+
+  # DENSITÉ
+  stat_density_2d(
+    aes(fill = after_stat(level)),
+    geom = "polygon",
+    alpha = 0.3,
+    contour = TRUE
+  ) +
+  
+  scale_fill_gradient(low = "white", high = "red", name = "Densité") +
+  
+  # Trajectoires
+  geom_path(
+    aes(group = interaction(individual.local.identifier, segment_id),
+        color = age_group),
+    alpha = 0.6,
+    linewidth = 0.4
+  ) +
+  
+  # SIT
+  geom_point(
+    data = DATA_sit_long_autumn,
+    aes(x = x, y = y, shape = "stop"),
+    color = "cornflowerblue",
+    size = 1.5
+  ) +
+  
+  # Nuit
+  geom_point(
+    data = subset(DATA_ALL_autumn, daynight_0 == "night"),
+    aes(x = x, y = y, shape = "night"),
+    color = "black",
+    size = 1,
+    alpha = 0.6
+  ) +
+  
+  coord_equal(expand = FALSE) +
+  
+  scale_color_manual(
+    values = c(
+    "juvenile" = "aquamarine3",  
+    "adult" = "brown"
+    ),
+    name = "Age"
+  ) +
+  
+  scale_shape_manual(
+    values = c("stop" = 18, "night" = 19),
+    name = "Stops"
+  ) +
+  
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+
+
+
+
+##### Carte avec biome : Tout est converti en sf
+
+# Tout convertir en sf propre
+pts_sf <- st_as_sf(
+  DATA_ALL_autumn,
+  coords = c("location.long", "location.lat"),
+  crs = 4326
+)
+sit_sf <- st_as_sf(
+  DATA_sit_long_autumn,
+  coords = c("location.long", "location.lat"),
+  crs = 4326
+)
+
+# Trajectoires en sf
+lines_sf <- pts_sf %>%
+  arrange(individual.local.identifier, timestamp) %>%   # adapter si besoin
+  group_by(individual.local.identifier, segment_id) %>%
+  summarise(do_union = FALSE) %>%
+  st_cast("LINESTRING")
+
+# DENSITÉ (remplacement de stat_density_2d)
+
+# Grille : kernel density raster
+library(MASS)
+coords <- st_coordinates(pts_sf)
+k <- kde2d(coords[,1], coords[,2], n = 200)
+
+# transformer en raster sf-compatible
+library(terra)
+r <- rast(k)
+crs(r) <- st_crs(pts_sf)$wkt
+
+# convertir en sf pour ggplot
+dens_sf <- as.data.frame(r, xy = TRUE)
+names(dens_sf) <- c("x", "y", "density")
+
+
+
+## Coupe et plot
+
+tibesti_sahara_proj <- st_transform(tibesti_sahara_proj, 4326)
+
+# Coupe
+cut_line <- st_sfc(
+  st_linestring(matrix(
+    c(10, -90,
+      10,  90),
+    ncol = 2,
+    byrow = TRUE
+  )),
+  crs = 4326
+)
+cut_line <- st_buffer(cut_line, 0)
+zone_west <- st_difference(
+  tibesti_sahara_proj,
+  st_sfc(
+    st_polygon(list(matrix(
+      c(10, -90,
+        180, -90,
+        180, 90,
+        10, 90,
+        10, -90),
+      ncol = 2,
+      byrow = TRUE
+    ))),
+    crs = 4326
+  )
+)
+plot(st_geometry(zone_west)) # Vérif
+
+# Plot
+ggplot() +
+
+  # zone tronquée
+  geom_sf(
+    data = zone_west,
+    fill = NA,
+    color = "azure2",
+    linewidth = 0.8
+  ) +
+
+  # densité
+  geom_raster(
+    data = dens_sf,
+    aes(x = x, y = y, fill = density),
+    alpha = 0.4
+  ) +
+
+  scale_fill_gradient(low = "white", high = "red", name = "Densité") +
+
+  # trajectoires
+  geom_sf(
+    data = lines_sf,
+    aes(color = individual.local.identifier),
+    alpha = 0.6,
+    linewidth = 0.4
+  ) +
+
+  # SIT
+  geom_sf(
+    data = sit_sf,
+    shape = 18,
+    color = "cornflowerblue",
+    size = 1.5
+  ) +
+
+  # nuit
+  geom_sf(
+    data = subset(pts_sf, daynight_0 == "night"),
+    color = "black",
+    size = 1,
+    alpha = 0.6
+  ) +
+
+  coord_sf() +
+
+  theme_minimal()
+
+
+
+#### Avec toutes les régions
+
+sf::sf_use_s2(FALSE)
+
+plot_sahara <- st_make_valid(st_transform(ecoregions, 4326))
+
+window_mask <- st_sfc(
+  st_polygon(list(matrix(
+    c(-180, 15,
+      10, 15,
+      10, 35,
+      -180, 35,
+      -180, 15),
+    ncol = 2,
+    byrow = TRUE
+  ))),
+  crs = 4326
+)
+
+plot_sahara <- st_make_valid(st_transform(ecoregions, 4326))
+window_mask <- st_make_valid(window_mask)
+
+zone_crop <- st_intersection(plot_sahara, window_mask)
+
+
+# Plot
+ggplot() +
+
+  # zone tronquée
+  geom_sf(
+    data = zone_crop,
+    fill = NA,
+    color = "azure2",
+    linewidth = 0.8
+  ) +
+
+  # densité
+  geom_raster(
+    data = dens_sf,
+    aes(x = x, y = y, fill = density),
+    alpha = 0.4
+  ) +
+
+  scale_fill_gradient(low = "white", high = "red", name = "Densité") +
+
+  # trajectoires
+  geom_sf(
+    data = lines_sf,
+    aes(color = individual.local.identifier),
+    alpha = 0.6,
+    linewidth = 0.4
+  ) +
+
+  # SIT
+  geom_sf(
+    data = sit_sf,
+    shape = 18,
+    color = "cornflowerblue",
+    size = 1.5
+  ) +
+
+  # nuit
+  geom_sf(
+    data = subset(pts_sf, daynight_0 == "night"),
+    color = "black",
+    size = 1,
+    alpha = 0.6
+  ) +
+
+  coord_sf() +
+
+  theme_minimal()
+
+
+```
+
+# Trajectoires par age_group
+
+## Spring
+
+### Juvéniles
+
+```{r}
+
+# Carte sans fond, pas en sf
+ggplot(DATA_ALL_spring_juv,
+       aes(x = x, y = y,
+           group = interaction(individual.local.identifier, segment_id),
+           color = individual.local.identifier)) +
+  
+  # Trajectoires
+  geom_path(alpha = 0.6, linewidth = 0.5) +
+  
+  # SIT prolongés
+  geom_point(
+    data = DATA_sit_long_spring_juv,
+    aes(x = x, y = y, shape = "stop"),
+    color = "cornflowerblue",
+    size = 1.5
+  ) +
+  
+  # Points de nuit
+  geom_point(
+    data = subset(DATA_ALL_spring_juv, daynight_0 == "night"),
+    aes(x = x, y = y, shape = "night"),
+    color = "black",
+    size = 1,
+    alpha = 0.6
+  ) +
+  
+  coord_equal(expand = FALSE) +
+  
+  scale_shape_manual(
+    values = c("stop" = 18, "night" = 19),
+    name = "Stops"
+  ) +
+  
+  labs(color = "Individu") +
+  
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+
+
+##### Carte avec biome : Tout est converti en sf
+
+# Tout convertir en sf propre
+pts_sf <- st_as_sf(
+  DATA_ALL_spring_juv,
+  coords = c("location.long", "location.lat"),
+  crs = 4326
+)
+sit_sf <- st_as_sf(
+  DATA_sit_long_spring_juv,
+  coords = c("location.long", "location.lat"),
+  crs = 4326
+)
+
+# Trajectoires en sf
+lines_sf <- pts_sf %>%
+  arrange(individual.local.identifier, timestamp) %>%   # adapter si besoin
+  group_by(individual.local.identifier, segment_id) %>%
+  summarise(do_union = FALSE) %>%
+  st_cast("LINESTRING")
+
+# DENSITÉ (remplacement de stat_density_2d)
+
+# Grille : kernel density raster
+library(MASS)
+coords <- st_coordinates(pts_sf)
+k <- kde2d(coords[,1], coords[,2], n = 200)
+
+# transformer en raster sf-compatible
+library(terra)
+r <- rast(k)
+crs(r) <- st_crs(pts_sf)$wkt
+
+# convertir en sf pour ggplot
+dens_sf <- as.data.frame(r, xy = TRUE)
+names(dens_sf) <- c("x", "y", "density")
+
+
+
+## Coupe et plot
+
+#### Avec toutes les régions
+
+sf::sf_use_s2(FALSE)
+
+plot_sahara <- st_make_valid(st_transform(ecoregions, 4326))
+
+window_mask <- st_sfc(
+  st_polygon(list(matrix(
+    c(-180, 15,
+      10, 15,
+      10, 35,
+      -180, 35,
+      -180, 15),
+    ncol = 2,
+    byrow = TRUE
+  ))),
+  crs = 4326
+)
+
+plot_sahara <- st_make_valid(st_transform(ecoregions, 4326))
+window_mask <- st_make_valid(window_mask)
+
+zone_crop <- st_intersection(plot_sahara, window_mask)
+
+
+
+
+# Plot
+ggplot() +
+
+  # zone tronquée
+  geom_sf(
+    data = zone_crop,
+    fill = NA,
+    color = "azure2",
+    linewidth = 0.8
+  ) +
+
+  # densité
+  geom_raster(
+    data = dens_sf,
+    aes(x = x, y = y, fill = density),
+    alpha = 0.4
+  ) +
+
+  scale_fill_gradient(low = "white", high = "red", name = "Densité") +
+
+  # trajectoires
+  geom_sf(
+    data = lines_sf,
+    aes(color = individual.local.identifier),
+    alpha = 0.6,
+    linewidth = 0.4
+  ) +
+
+  # SIT
+  geom_sf(
+    data = sit_sf,
+    shape = 18,
+    color = "cornflowerblue",
+    size = 1.5
+  ) +
+
+  # nuit
+  geom_sf(
+    data = subset(pts_sf, daynight_0 == "night"),
+    color = "black",
+    size = 1,
+    alpha = 0.6
+  ) +
+
+  coord_sf() +
+
+  theme_minimal()
+```
+
+### Adultes
+
+```{r}
+ggplot(DATA_ALL_spring_ad,
+       aes(x = x, y = y,
+           group = interaction(individual.local.identifier, segment_id),
+           color = individual.local.identifier)) +
+  
+  # Trajectoires
+  geom_path(alpha = 0.6, linewidth = 0.5) +
+  
+  # SIT prolongés
+  geom_point(
+    data = DATA_sit_long_spring_ad,
+    aes(x = x, y = y, shape = "stop"),
+    color = "cornflowerblue",
+    size = 1.5
+  ) +
+  
+  # Points de nuit
+  geom_point(
+    data = subset(DATA_ALL_spring_ad, daynight_0 == "night"),
+    aes(x = x, y = y, shape = "night"),
+    color = "black",
+    size = 1,
+    alpha = 0.6
+  ) +
+  
+  coord_equal(expand = FALSE) +
+  
+  scale_shape_manual(
+    values = c("stop" = 18, "night" = 19),
+    name = "Stops"
+  ) +
+  
+  labs(color = "Individu") +
+  
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+
+
+
+##### Carte avec biome : Tout est converti en sf
+
+# Tout convertir en sf propre
+pts_sf <- st_as_sf(
+  DATA_ALL_spring_ad,
+  coords = c("location.long", "location.lat"),
+  crs = 4326
+)
+sit_sf <- st_as_sf(
+  DATA_sit_long_spring_ad,
+  coords = c("location.long", "location.lat"),
+  crs = 4326
+)
+
+# Trajectoires en sf
+lines_sf <- pts_sf %>%
+  arrange(individual.local.identifier, timestamp) %>%   # adapter si besoin
+  group_by(individual.local.identifier, segment_id) %>%
+  summarise(do_union = FALSE) %>%
+  st_cast("LINESTRING")
+
+# DENSITÉ (remplacement de stat_density_2d)
+
+# Grille : kernel density raster
+library(MASS)
+coords <- st_coordinates(pts_sf)
+k <- kde2d(coords[,1], coords[,2], n = 200)
+
+# transformer en raster sf-compatible
+library(terra)
+r <- rast(k)
+crs(r) <- st_crs(pts_sf)$wkt
+
+# convertir en sf pour ggplot
+dens_sf <- as.data.frame(r, xy = TRUE)
+names(dens_sf) <- c("x", "y", "density")
+
+
+
+## Coupe et plot
+
+#### Avec toutes les régions
+
+sf::sf_use_s2(FALSE)
+
+plot_sahara <- st_make_valid(st_transform(ecoregions, 4326))
+
+window_mask <- st_sfc(
+  st_polygon(list(matrix(
+    c(-180, 15,
+      10, 15,
+      10, 35,
+      -180, 35,
+      -180, 15),
+    ncol = 2,
+    byrow = TRUE
+  ))),
+  crs = 4326
+)
+
+plot_sahara <- st_make_valid(st_transform(ecoregions, 4326))
+window_mask <- st_make_valid(window_mask)
+
+zone_crop <- st_intersection(plot_sahara, window_mask)
+
+
+
+
+# Plot
+ggplot() +
+
+  # zone tronquée
+  geom_sf(
+    data = zone_crop,
+    fill = NA,
+    color = "azure2",
+    linewidth = 0.8
+  ) +
+
+  # densité
+  geom_raster(
+    data = dens_sf,
+    aes(x = x, y = y, fill = density),
+    alpha = 0.4
+  ) +
+
+  scale_fill_gradient(low = "white", high = "red", name = "Densité") +
+
+  # trajectoires
+  geom_sf(
+    data = lines_sf,
+    aes(color = individual.local.identifier),
+    alpha = 0.6,
+    linewidth = 0.4
+  ) +
+
+  # SIT
+  geom_sf(
+    data = sit_sf,
+    shape = 18,
+    color = "cornflowerblue",
+    size = 1.5
+  ) +
+
+  # nuit
+  geom_sf(
+    data = subset(pts_sf, daynight_0 == "night"),
+    color = "black",
+    size = 1,
+    alpha = 0.6
+  ) +
+
+  coord_sf() +
+
+  theme_minimal()
+```
+
+## Autumn
+
+### Juvéniles
+
+```{r}
+
+ggplot(DATA_ALL_autumn_juv,
+       aes(x = x, y = y,
+           group = interaction(individual.local.identifier, segment_id),
+           color = individual.local.identifier)) +
+  
+  # Trajectoires
+  geom_path(alpha = 0.6, linewidth = 0.5) +
+  
+  # SIT prolongés
+  geom_point(
+    data = DATA_sit_long_autumn_juv,
+    aes(x = x, y = y, shape = "stop"),
+    color = "cornflowerblue",
+    size = 1.5
+  ) +
+  
+  # Points de nuit
+  geom_point(
+    data = subset(DATA_ALL_autumn_juv, daynight_0 == "night"),
+    aes(x = x, y = y, shape = "night"),
+    color = "black",
+    size = 1,
+    alpha = 0.6
+  ) +
+  
+  coord_equal(expand = FALSE) +
+  
+  scale_shape_manual(
+    values = c("stop" = 18, "night" = 19),
+    name = "Stops"
+  ) +
+  
+  labs(color = "Individu") +
+  
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+
+
+
+##### Carte avec biome : Tout est converti en sf
+
+# Tout convertir en sf propre
+pts_sf <- st_as_sf(
+  DATA_ALL_autumn_juv,
+  coords = c("location.long", "location.lat"),
+  crs = 4326
+)
+sit_sf <- st_as_sf(
+  DATA_sit_long_autumn_juv,
+  coords = c("location.long", "location.lat"),
+  crs = 4326
+)
+
+# Trajectoires en sf
+lines_sf <- pts_sf %>%
+  arrange(individual.local.identifier, timestamp) %>%   # adapter si besoin
+  group_by(individual.local.identifier, segment_id) %>%
+  summarise(do_union = FALSE) %>%
+  st_cast("LINESTRING")
+
+# DENSITÉ (remplacement de stat_density_2d)
+
+# Grille : kernel density raster
+library(MASS)
+coords <- st_coordinates(pts_sf)
+k <- kde2d(coords[,1], coords[,2], n = 200)
+
+# transformer en raster sf-compatible
+library(terra)
+r <- rast(k)
+crs(r) <- st_crs(pts_sf)$wkt
+
+# convertir en sf pour ggplot
+dens_sf <- as.data.frame(r, xy = TRUE)
+names(dens_sf) <- c("x", "y", "density")
+
+
+
+## Coupe et plot
+
+#### Avec toutes les régions
+
+sf::sf_use_s2(FALSE)
+
+plot_sahara <- st_make_valid(st_transform(ecoregions, 4326))
+
+window_mask <- st_sfc(
+  st_polygon(list(matrix(
+    c(-180, 15,
+      10, 15,
+      10, 35,
+      -180, 35,
+      -180, 15),
+    ncol = 2,
+    byrow = TRUE
+  ))),
+  crs = 4326
+)
+
+plot_sahara <- st_make_valid(st_transform(ecoregions, 4326))
+window_mask <- st_make_valid(window_mask)
+
+zone_crop <- st_intersection(plot_sahara, window_mask)
+
+
+
+
+# Plot
+ggplot() +
+
+  # zone tronquée
+  geom_sf(
+    data = zone_crop,
+    fill = NA,
+    color = "azure2",
+    linewidth = 0.8
+  ) +
+
+  # densité
+  geom_raster(
+    data = dens_sf,
+    aes(x = x, y = y, fill = density),
+    alpha = 0.4
+  ) +
+
+  scale_fill_gradient(low = "white", high = "red", name = "Densité") +
+
+  # trajectoires
+  geom_sf(
+    data = lines_sf,
+    aes(color = individual.local.identifier),
+    alpha = 0.6,
+    linewidth = 0.4
+  ) +
+
+  # SIT
+  geom_sf(
+    data = sit_sf,
+    shape = 18,
+    color = "cornflowerblue",
+    size = 1.5
+  ) +
+
+  # nuit
+  geom_sf(
+    data = subset(pts_sf, daynight_0 == "night"),
+    color = "black",
+    size = 1,
+    alpha = 0.6
+  ) +
+
+  coord_sf() +
+
+  theme_minimal()
+```
+
+### Adultes
+
+```{r}
+
+# Sans biomes
+ggplot(DATA_ALL_autumn_ad,
+       aes(x = x, y = y,
+           group = interaction(individual.local.identifier, segment_id),
+           color = individual.local.identifier)) +
+  
+  # Trajectoires
+  geom_path(alpha = 0.6, linewidth = 0.5) +
+  
+  # SIT prolongés
+  geom_point(
+    data = DATA_sit_long_autumn_ad,
+    aes(x = x, y = y, shape = "stop"),
+    color = "cornflowerblue",
+    size = 1.5
+  ) +
+  
+  # Points de nuit
+  geom_point(
+    data = subset(DATA_ALL_autumn_ad, daynight_0 == "night"),
+    aes(x = x, y = y, shape = "night"),
+    color = "black",
+    size = 1,
+    alpha = 0.6
+  ) +
+  
+  coord_equal(expand = FALSE) +
+  
+  scale_shape_manual(
+    values = c("stop" = 18, "night" = 19),
+    name = "Stops"
+  ) +
+  
+  labs(color = "Individu") +
+  
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+
+# Avec biomes
+##### Carte avec biome : Tout est converti en sf
+
+# Tout convertir en sf propre
+pts_sf <- st_as_sf(
+  DATA_ALL_autumn_ad,
+  coords = c("location.long", "location.lat"),
+  crs = 4326
+)
+sit_sf <- st_as_sf(
+  DATA_sit_long_autumn_ad,
+  coords = c("location.long", "location.lat"),
+  crs = 4326
+)
+
+# Trajectoires en sf
+lines_sf <- pts_sf %>%
+  arrange(individual.local.identifier, timestamp) %>%   # adapter si besoin
+  group_by(individual.local.identifier, segment_id) %>%
+  summarise(do_union = FALSE) %>%
+  st_cast("LINESTRING")
+
+# DENSITÉ (remplacement de stat_density_2d)
+
+# Grille : kernel density raster
+library(MASS)
+coords <- st_coordinates(pts_sf)
+k <- kde2d(coords[,1], coords[,2], n = 200)
+
+# transformer en raster sf-compatible
+library(terra)
+r <- rast(k)
+crs(r) <- st_crs(pts_sf)$wkt
+
+# convertir en sf pour ggplot
+dens_sf <- as.data.frame(r, xy = TRUE)
+names(dens_sf) <- c("x", "y", "density")
+
+
+
+## Coupe et plot
+
+#### Avec toutes les régions
+
+sf::sf_use_s2(FALSE)
+
+plot_sahara <- st_make_valid(st_transform(ecoregions, 4326))
+
+window_mask <- st_sfc(
+  st_polygon(list(matrix(
+    c(-180, 15,
+      10, 15,
+      10, 35,
+      -180, 35,
+      -180, 15),
+    ncol = 2,
+    byrow = TRUE
+  ))),
+  crs = 4326
+)
+
+plot_sahara <- st_make_valid(st_transform(ecoregions, 4326))
+window_mask <- st_make_valid(window_mask)
+
+zone_crop <- st_intersection(plot_sahara, window_mask)
+
+
+
+
+# Plot
+ggplot() +
+
+  # zone tronquée
+  geom_sf(
+    data = zone_crop,
+    fill = NA,
+    color = "azure2",
+    linewidth = 0.8
+  ) +
+
+  # densité
+  geom_raster(
+    data = dens_sf,
+    aes(x = x, y = y, fill = density),
+    alpha = 0.4
+  ) +
+
+  scale_fill_gradient(low = "white", high = "red", name = "Densité") +
+
+  # trajectoires
+  geom_sf(
+    data = lines_sf,
+    aes(color = individual.local.identifier),
+    alpha = 0.6,
+    linewidth = 0.4
+  ) +
+
+  # SIT
+  geom_sf(
+    data = sit_sf,
+    shape = 18,
+    color = "cornflowerblue",
+    size = 1.5
+  ) +
+
+  # nuit
+  geom_sf(
+    data = subset(pts_sf, daynight_0 == "night"),
+    color = "black",
+    size = 1,
+    alpha = 0.6
+  ) +
+
+  coord_sf() +
+
+  theme_minimal()
+```
+
+# Régularité sur toute la migration
+
+## Calcul de l'indice de régularité /!\\ A améliorer
+
+Indice de régularité = **Distance moyenne entre les trajectoires d’un même individu, pour une saison donnée,**
+
+On compare les trajectoires **au même moment.**
+
+Aussi, il faut prendre en compte dans quel sens est cette distance, si on est décalé à droite, à gauche?
+
+/!\\ Biais : La variabilité augmente surement plus on a de migration
+
+Création de df_summary
+
+```{r}
+meta <- DATA_ALL %>%
+  filter(!is.na(MIGRATION), !is.na(age_group)) %>%
+  distinct(individual.local.identifier, MIGRATION, bird_year, age_group)
+
+results <- list()
+
+for(id in unique(meta$individual.local.identifier)) {
+  for(seas in unique(meta$MIGRATION)) {
+    idx <- which(meta$individual.local.identifier == id & meta$MIGRATION == seas)
+    if(length(idx) > 1) {
+      trajs <- traj_list_interp[idx]
+      results[[length(results) + 1]] <- data.frame(
+        individual = id,
+        season = seas,
+        variability = pairwise_dist(trajs),
+        age = meta$age_group[idx[1]]
+      )
+    }
+  }
+}
+
+df_summary <- do.call(rbind, results)
+
+# véfification
+head(df_summary)
+table(df_summary$age, df_summary$season)
+```
+
+## Comparaison de la régularité
+
+```{r}
+# Visualisation de la régulatité sans tenir compte de la saison
+ggplot(df_summary, aes(x = age, y = variability, fill = age)) +
+  geom_boxplot(alpha = 0.6) +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  theme_minimal()
+
+# Représentation de la régularité par saison
+ggplot(df_summary, aes(x = age, y = variability, fill = age)) +
+  geom_boxplot(alpha = 0.6) +
+  facet_wrap(~ season) +
+  stat_compare_means(method = "t.test", label = "p.format") +
+  theme_minimal() +
+  scale_fill_manual(values = c("juvenile" = "darkorange1", "adult" = "darkorchid2"))
+```
+
+## Représentation de la régularité sur les trajectoires
+
+L'indice est **par individu + saison**
+
+### Spring
+
+```{r}
+#| eval: false
+#| include: false
+# Ajouter l'indice aux trajcetoires
+DATA_plot <- DATA_ALL_spring %>%
+  left_join(df_summary, by = c(
+    "individual.local.identifier" = "individual",
+    "MIGRATION" = "season"
+  ))
+```
+
+```{r}
+#| eval: false
+#| include: false
+ggplot(DATA_plot, aes(x = x, y = y)) +
+
+  # DENSITÉ
+  stat_density_2d(
+    aes(fill = after_stat(level)),
+    geom = "polygon",
+    alpha = 0.25
+  ) +
+
+  # TRAJECTOIRES colorées par régularité
+  geom_path(
+    aes(group = individual.local.identifier, color = variability),
+    alpha = 0.7,
+    linewidth = 0.5
+  ) +
+
+  coord_equal(expand = FALSE) +
+
+  scale_color_viridis_c(option = "magma", direction = -1) +
+
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+```
+
+### Autumn
+
+```{r}
+#| eval: false
+#| include: false
+# Ajouter l'indice aux trajcetoires
+DATA_plot <- DATA_ALL_autumn %>%
+  left_join(df_summary, by = c(
+    "individual.local.identifier" = "individual",
+    "MIGRATION" = "season"
+  ))
+```
+
+```{r}
+#| eval: false
+#| include: false
+ggplot(DATA_plot, aes(x = x, y = y)) +
+
+  # DENSITÉ
+  stat_density_2d(
+    aes(fill = after_stat(level)),
+    geom = "polygon",
+    alpha = 0.25
+  ) +
+
+  # TRAJECTOIRES colorées par régularité
+  geom_path(
+    aes(group = individual.local.identifier, color = variability),
+    alpha = 0.7,
+    linewidth = 0.5
+  ) +
+
+  coord_equal(expand = FALSE) +
+
+  scale_color_viridis_c(option = "magma", direction = -1) +
+
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+```
+
+# Régularité par zone (grille spatiale) \# Problèmes mais meilleure idée
+
+## Spring
+
+```{r}
+# Créer une grille spatiale
+DATA_grid <- DATA_ALL_spring %>%
+  mutate(
+    x_bin = round(x, 1),   
+    y_bin = round(y, 1)
+  )
+```
+
+```{r}
+# Créer une régularité locale
+grid_summary <- DATA_grid %>%
+  group_by(x_bin, y_bin) %>%
+  summarise(
+    n_ind = n_distinct(individual.local.identifier),
+    sd_x = sd(x),
+    sd_y = sd(y),
+    regularity = sqrt(sd_x^2 + sd_y^2),
+    .groups = "drop"
+  )
+# => Si la régularité est faible, probablement zone critique
+```
+
+```{r}
+# Représentation
+
+ggplot() +
+
+  # CARTE DE RÉGULARITÉ
+  geom_tile(
+    data = grid_summary,
+    aes(x = x_bin, y = y_bin, fill = regularity)
+  ) +
+
+  # TRAJECTOIRES AU-DESSUS
+  geom_path(
+    data = DATA_ALL_spring,
+    aes(x = x, y = y,
+        group = interaction (individual.local.identifier,segment_id),
+        color = age_group),
+    alpha = 0.5,
+    linewidth = 0.4
+  ) +
+
+  coord_equal() +
+
+  scale_fill_viridis_c(
+    option = "magma",
+    direction = -1,   # zones fidèles en foncé
+    name = "Régularité"
+  ) +
+
+  scale_color_manual(values = c(
+    "juvenile" = "deeppink1",
+    "adult" = "darkgoldenrod1"
+  )) +
+
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+```
+
+## Autumn
+
+```{r}
+# Créer une grille spatiale
+DATA_grid <- DATA_ALL_autumn %>%
+  mutate(
+    x_bin = round(x, 1),   # ajuste la résolution (0.1, 0.2…)
+    y_bin = round(y, 1)
+  )
+```
+
+```{r}
+# Créer une régularité locale
+grid_summary <- DATA_grid %>%
+  group_by(x_bin, y_bin) %>%
+  summarise(
+    n_ind = n_distinct(individual.local.identifier),
+    sd_x = sd(x),
+    sd_y = sd(y),
+    regularity = sqrt(sd_x^2 + sd_y^2),
+    .groups = "drop"
+  )
+# => Si la régularité est faible, probablement zone critique
+```
+
+```{r}
+# Représentation
+
+ggplot() +
+
+  # CARTE DE RÉGULARITÉ
+  geom_tile(
+    data = grid_summary,
+    aes(x = x_bin, y = y_bin, fill = regularity)
+  ) +
+
+  # TRAJECTOIRES AU-DESSUS
+  geom_path(
+    data = DATA_ALL_spring,
+    aes(x = x, y = y,
+        group = interaction (individual.local.identifier,segment_id),
+        color = age_group),
+    alpha = 0.5,
+    linewidth = 0.4
+  ) +
+
+  coord_equal() +
+
+  scale_fill_viridis_c(
+    option = "magma",
+    direction = -1,   # zones fidèles en foncé
+    name = "Régularité"
+  ) +
+
+  scale_color_manual(values = c(
+    "juvenile" = "aquamarine3",
+    "adult" = "brown"
+  )) +
+
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+```
+
+# Effet du vent

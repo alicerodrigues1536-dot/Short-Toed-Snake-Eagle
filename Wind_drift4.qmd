@@ -1,0 +1,2042 @@
+---
+title: "Wind drift"
+author: "Alice Rodrigues"
+format: html
+editor: visual
+---
+
+# Librairies
+
+```{r}
+### Read packages 
+ipak <- function(pkg){
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])] # Code Vansteelant
+  if (length(new.pkg)) 
+    install.packages(new.pkg, dependencies = TRUE)
+  sapply(pkg, require, character.only = TRUE)
+}
+
+# usage
+packages <- c("RNCEP","rsq")
+ipak(packages)
+
+# read all wind data previously extracted by RNCEP
+#winds <- read.csv('./Figures 2021/EF_migration_traveldays_winddata-v20210105.csv')
+# Direcetement depuis internet
+library(RNCEP)
+
+library(here)
+library(dplyr)
+library(lubridate)
+library(geosphere)
+library(FNN)
+library(purrr)
+library(ggplot2)
+
+
+library(ecmwfr)
+library(ncdf4)
+
+library(ggplot2)
+library(maps)
+
+library(conflicted)
+```
+
+# Chargement des données
+
+## Vent
+
+```{r}
+#| eval: false
+#| include: false
+
+# Clé récupérée sur le site Copernicus
+wf_set_key(key = "a1abcb34-5760-4afa-830f-0ad2c9869278")
+
+
+# Télécharger les données vent 925 hPa
+
+area_bbox <- c(34, -20, 15, 30)
+
+for (yr in 2020:2026) {
+  for (mo in 1:12) {
+    
+    # Éviter les mois futurs (2026)
+    if (yr == 2026 && mo > as.integer(format(Sys.Date(), "%m"))) break
+    
+    filename <- paste0("era5_wind925_sahara_", yr, sprintf("%02d", mo), ".nc")
+    
+    # Sauter si déjà téléchargé
+    if (file.exists(filename)) {
+      cat("⏭ Déjà présent :", filename, "\n")
+      next
+    }
+    
+    request <- list(
+      dataset_short_name = "reanalysis-era5-pressure-levels",
+      product_type   = "reanalysis",
+      variable       = c("u_component_of_wind", "v_component_of_wind"),
+      pressure_level = "925", # 850hPa Equivaux à 1500m d'altitude, sinon 925hPa pour  hPa~750 m
+      year           = as.character(yr),
+      month          = sprintf("%02d", mo),
+      day            = sprintf("%02d", 1:31),
+      time           = sprintf("%02d:00", 0:23),
+      area           = area_bbox,
+      data_format    = "netcdf",
+      target         = filename
+    )
+    
+    tryCatch({
+      wf_request(request = request, transfer = TRUE, path = ".")
+      cat("✓ Téléchargé :", yr, sprintf("%02d", mo), "\n")
+    }, error = function(e) {
+      cat("✗ Erreur :", yr, sprintf("%02d", mo), "-", conditionMessage(e), "\n")
+    })
+    
+  }
+}
+
+
+# Inspecter le premier fichier
+nc <- nc_open("era5_wind925_sahara_202001.nc")
+print(nc)  # affiche toutes les variables et dimensions disponibles
+nc_close(nc)
+
+
+# Lire et mettre au format NCEP et stocker
+
+
+read_era5_wind <- function(yr, mo) {
+  filename <- paste0("era5_wind925_sahara_", yr, sprintf("%02d", mo), ".nc")
+  if (!file.exists(filename)) {
+    cat("Manquant :", filename, "\n")
+    return(NULL)
+  }
+  
+  nc         <- nc_open(filename)
+  lon        <- ncvar_get(nc, "longitude")
+  lat        <- ncvar_get(nc, "latitude")
+  valid_time <- ncvar_get(nc, "valid_time")       # secondes depuis 1970-01-01
+  u          <- ncvar_get(nc, "u")                # [lon, lat, pressure_level, time]
+  v          <- ncvar_get(nc, "v")
+  nc_close(nc)
+  
+  dates <- as.POSIXct(valid_time, origin = "1970-01-01", tz = "UTC")
+  
+  # u/v sont [lon, lat, 1, time] → on supprime la dimension pressure_level
+  u <- drop(u)  # devient [lon, lat, time]
+  v <- drop(v)
+  
+  grid       <- expand.grid(longitude = lon, latitude = lat, datetime = dates)
+  grid$uwnd  <- as.vector(u)
+  grid$vwnd  <- as.vector(v)
+  
+  return(grid)
+}
+
+# Lire et assembler tout
+winds <- bind_rows(lapply(2020:2026, function(yr) {
+  bind_rows(lapply(1:12, function(mo) read_era5_wind(yr, mo)))
+}))
+
+str(winds)
+# 'data.frame': X obs. of 4 variables:
+#  $ datetime  : POSIXct
+#  $ latitude  : num
+#  $ longitude : num
+#  $ uwnd      : num   (m/s, positif = vers l'est)
+#  $ vwnd      : num   (m/s, positif = vers le nord)
+
+# RDS — 5-10x plus petit, lecture rapide
+saveRDS(winds,
+        file = here("Alice/Data_analysis_June_2026/Analyses/winds_era5_925hPa_2020_2026.rds"))
+```
+
+Chargement direct
+
+```{r}
+winds <- readRDS(here("Alice/Data_analysis_June_2026/Analyses/winds_era5_925hPa_2020_2026.rds"))
+str(winds)
+unique(winds$latitude)
+```
+
+## Vol
+
+```{r}
+# HF et BF : 1 ligne = 1 point toute les 5min
+load(here("Alice/STE_data_preparation_June_2026/2.Data_preparation/2.1_OUTPUT_STE_France_processed_sub5_A_2026-06-04.RData"))
+# data_sub5
+```
+
+# Préparation des données brutes (data_sub5)
+
+## Séléction de la zone
+
+```{r}
+#| include: false
+
+conflicts_prefer(dplyr::filter)
+# Création de la zone
+library(sf)
+ecoregions <- st_read(here( "Alice/Data_analysis_June_2026/Ecoregions2017/Ecoregions2017.shp"), wkt_filter = st_as_text( st_as_sfc(st_bbox(c( xmin = -20, xmax = 60, ymin = 0, ymax = 40 ), crs = 4326)) ) ) 
+names(ecoregions) 
+#unique(ecoregions$BIOME_NAME)
+#unique(ecoregions$ECO_NAME)
+
+desert <- ecoregions[ecoregions$BIOME_NAME == "Deserts & Xeric Shrublands", ] 
+plot(desert["BIOME_NAME"])
+
+sahara <- ecoregions[grepl("Sahara", ecoregions$ECO_NAME), ] 
+plot(sahara["BIOME_NAME"])
+
+tibesti_sahara <- ecoregions[grepl("Sahara|Tibesti-Jebel Uweinat", ecoregions$ECO_NAME), ] 
+plot(tibesti_sahara["BIOME_NAME"])
+
+
+# sf de data_sub5 et superposition du sf tibesti_sahara
+
+# bottom :  latitude 17.51, bottom of the South Geofence
+pts_sf <- st_as_sf(data_sub5, coords = c("location.long", "location.lat"), crs = 4326)
+
+coords <- st_coordinates(pts_sf)
+# coords[,1] = longitude, coords[,2] = latitude
+lat <- coords[,2]
+intersects_vec <- apply(st_intersects(pts_sf, tibesti_sahara, sparse = FALSE), 1, any)
+
+pts_sf$Zone_interet <- ifelse(
+  (lat >= 17.51 & lat <= 26.0) | intersects_vec,
+  "Zone_interet",
+  NA
+)
+unique(pts_sf$Zone_interet)
+# Check
+tab <- table(pts_sf$Zone_interet, useNA = "ifany")
+# proportion
+prop <- tab / sum(tab) * 100
+prop
+# Add Zone_interet to data
+data_sub5$Zone_interet <- pts_sf$Zone_interet
+
+## Séléction seulement de la Zone_intêret
+data_sub5 <- data_sub5 %>%
+  filter(!is.na(Zone_interet))
+
+```
+
+## Colonnes utiles
+
+### Ajout de la saison et année basé sur la date
+
+```{r}
+data_sub5$date <- as.Date(data_sub5$timestamp)
+head(data_sub5$date)
+data_sub5 <- data_sub5 %>%
+  mutate(
+    MIGRATION = case_when(
+      month(date) %in% 1:7  ~ "spring",
+      month(date) %in% 8:12 ~ "autumn",
+      TRUE ~ NA_character_
+    )
+  )
+data_sub5 <- data_sub5 %>%
+  mutate(year = year(timestamp))
+```
+
+### Variable "age" simplifiée en juvéniles/adultes
+
+```{r}
+data_sub5 <- data_sub5 %>%
+  mutate(
+    age_group = case_when(
+      age_CY == "adult" ~ "adult",
+      !is.na(age_CY) & age_CY != "adult" ~ "juvenile",
+      TRUE ~ NA_character_
+    )
+  )
+table(data_sub5$age_group, useNA = "ifany")
+```
+
+## Gestion des anomalies
+
+```{r}
+# Découpe des anomalies data_sub5
+
+# Charline
+start_time <- as.POSIXct("2025-05-10 13:00:00", tz = "UTC")
+end_time   <- as.POSIXct("2025-09-24 10:00:00", tz = "UTC")
+data_sub5 <- data_sub5[
+  !(
+    data_sub5$timestamp >= start_time &
+    data_sub5$timestamp <= end_time &
+    data_sub5$individual.local.identifier == "Charline de la Grisonnière"
+  ),
+]
+# Mina
+data_sub5 <- data_sub5[
+  !(
+    data_sub5$country == "Tunisia" &
+    data_sub5$individual.local.identifier == "Mina de Rians"
+  ),
+]
+```
+
+## Découpe
+
+```{r}
+# JDD séparé entre spring et autumn dans la Zone_interet toujours
+data_sub5_spring <- subset(data_sub5, MIGRATION == "spring")
+data_sub5_autumn <- subset(data_sub5, MIGRATION == "autumn")
+```
+
+# All : Spring + Autumn
+
+## Destination et theta_reference
+
+```{r}
+
+# (θ_reference) =  The latter was calculated as the rhumb line bearing from the first to the last 
+#location of the track. This reference direction is considered the intended direction the bird would 
+#move into in the absence of wind.
+
+
+# track_direction et theta_reference : par rapport au track complet
+#track_direction <- data_sub5 %>%
+#  group_by(track_ID) %>%
+#  summarise(
+#    first_lon = first(location.long),
+#    first_lat = first(location.lat),
+#    last_lon  = last(location.long),
+#    last_lat  = last(location.lat),
+#    theta_reference = bearing(
+#      cbind(first_lon, first_lat),
+#      cbind(last_lon, last_lat)
+#    ),
+#    .groups = "drop"
+#  )
+#summary(track_direction$theta_reference) # Rq : il faut absolument séparer par saison.
+
+
+
+# Ou définir une position de fin et la prendre pour référence : Angle par rapport à cette position
+
+# Supprimer toutes les versions et refaire proprement
+#data_sub5 <- data_sub5 %>%
+#  select(-dest_lon.x, -dest_lat.x, -dest_lon.y, -dest_lat.y, -theta_reference)
+
+# Recalculer destinations
+destinations <- data_sub5 %>%
+  group_by(individual.local.identifier, MIGRATION, year) %>% #Bien groupé
+  summarise(
+    dest_lon = last(location.long),
+    dest_lat = last(location.lat),
+    .groups = "drop"
+  )
+
+# Joindre
+data_sub5 <- data_sub5 %>%
+  left_join(destinations, by = c("individual.local.identifier", "MIGRATION", "year"))
+
+# Calculer theta_reference
+data_sub5 <- data_sub5 %>%
+  mutate(
+    theta_reference = bearing(
+      cbind(location.long, location.lat),
+      cbind(dest_lon, dest_lat)
+    ),
+    theta_reference = ifelse(theta_reference > 180, theta_reference - 360, theta_reference)
+  )
+```
+
+## Créer des segments
+
+"High-frequency bursts (GPS-position every 3 seconds) were subsampled to the basic 10 minute \# Nous on a 5min sampling rate. For the current analysis data from 19 individuals that completed at least one autumn and one spring migration was used. Several of these individuals were tracked for multiple years. Each track was assigned a unique ID based on bird ID (name of the bird), season (autumn or spring migration), and year (2009-2015). The GPS-data were subdivided in daily (first and last position of the day) and hourly (first and last position of the hour) flight segments. For each GPS-location, it was determined whether the bird was flying or sitting, based on the instantaneous speed recorded by the GPS logger. The frequency distribution of instantaneous flight speeds was strongly bi-modal and we used a threshold value of 2.0 m/s to distinguish between sitting and flying. Only hourly flight sections that had at least five consecutive flight positions were selected (i.e. in this way possible flight-and-forage behaviour was excluded). Also the few segments where the bird was migrating during the night were excluded. Furthermore, only days with at least four hourly segments and tracks with at least 10 migration days were selected."
+
+```{r}
+# Seulement garder les individus qui ont eu au moins une migration de printemps et une d'automne? -> On va pas faire ça
+
+# Garder que les positions de jour
+data_sub5 <- data_sub5 %>%
+  filter(daynight_0 == "day")
+
+# Créer un ID par segment
+data_sub5 <- data_sub5 %>%
+  mutate(track_ID = paste(individual.local.identifier, MIGRATION, year, sep = "_"))
+
+# Filtre : seulement les hourly segments avec au moins 5 moves successifs
+hourly_filtered <- data_sub5 %>%
+  mutate(hour = floor_date(timestamp, "hour")) %>%
+  group_by(track_ID, hour) %>%
+  arrange(timestamp) %>%
+  filter(sum(move_2 == "move", na.rm = TRUE) >= 5) %>%
+  ungroup()
+
+# Hourly segments
+hourly_segments <- hourly_filtered %>%
+  mutate(hour = as.POSIXct(hour, tz = "UTC")) %>%
+  group_by(track_ID, hour) %>%
+  summarise(
+    first_lon       = first(location.long),
+    first_lat       = first(location.lat),
+    last_lon        = last(location.long),
+    last_lat        = last(location.lat),
+    n_moves         = sum(move_2 == "move"),
+    theta_reference = first(theta_reference),
+    age_group       = first(age_group),
+    MIGRATION       = first(MIGRATION),
+    year            = first(year),
+
+    .groups = "drop"
+  )
+
+# Daily segments (au moins 4 hourly segments par jour)
+daily_segments <- hourly_segments %>%
+  mutate(date_day = as.Date(hour)) %>%
+  group_by(track_ID, date_day) %>%
+  filter(n() >= 4) %>%
+  summarise(
+    first_lon       = first(first_lon),
+    first_lat       = first(first_lat),
+    last_lon        = last(last_lon),
+    last_lat        = last(last_lat),
+    theta_reference = first(theta_reference),
+    n_hours         = n(),
+    .groups = "drop"
+  )
+
+# Filtrer les tracks avec au moins 2 jours de migration
+daily_segments <- daily_segments %>%
+  group_by(track_ID) %>%
+  filter(n() >= 2) %>%
+  ungroup()
+
+
+# Séléction seulement les hourly segments qui ont plus de 5 move successifs sont conservés
+# Pour les daily segments, seulement ceux avec au moins 4 hourly segment sont conservés
+# Et les tracks totaux sont conservés seulement si ils ont au mois 10 (# Nous 2) jours de migration # -> Trop pour nous
+```
+
+## Calculs mouvement
+
+```{r}
+# Theta_segment : cap de déplacement du segment
+hourly_segments <- hourly_segments %>%
+  mutate(
+    theta_segment = bearing(
+      cbind(first_lon, first_lat),
+      cbind(last_lon, last_lat)
+    )
+  )
+
+
+# Distance
+
+# Il calcule une distance par segment avec Geosphère. Moi j'ai déjà mes distances calculées entre chaque point subsamplés à 5min.
+# Et ensuite il calcule  segment speed, la vitesse par segment
+# Peut être une bonne idée dans data_sub5 et on a ground_speed par point.
+
+### Calcul de la distance par segment avec Geosphere
+# Rq (je suis pas fan de cette méthode, on a les disances plus précises entre points subsamplés à 5 min, étrange de recalculer beaucoup plus approximativement, peut être pour une cohérence par la suite? A voir)
+
+# Distance par segment (approximation premier-dernier point)
+hourly_segments <- hourly_segments %>%
+  mutate(
+    distance_m     = distHaversine(cbind(first_lon, first_lat), cbind(last_lon, last_lat)),
+    segment_speed  = distance_m / 3600  # m/s (1h = 3600 secondes)
+  )
+
+daily_segments <- daily_segments %>%
+  mutate(
+    distance_m = distHaversine(cbind(first_lon, first_lat), cbind(last_lon, last_lat))
+  )
+
+# Distance précise : somme des distances point-à-point par segment horaire
+dist_precise <- data_sub5 %>%
+  mutate(hour = floor_date(timestamp, "hour")) %>%
+  group_by(track_ID, hour) %>%
+  summarise(distance_m_precise = sum(ddist_2D, na.rm = TRUE), .groups = "drop") %>%
+  mutate(hour = as.POSIXct(hour, tz = "UTC"))
+
+hourly_segments <- hourly_segments %>%
+  left_join(dist_precise, by = c("track_ID", "hour"))
+```
+
+## Calculs vent et join
+
+```{r}
+### Calcul de la vitesse vectorielle du vent, direction et angle
+
+
+### Assignation du vent aux hourly_segments ###
+hourly_segments$uwnd       <- NA
+hourly_segments$vwnd       <- NA
+hourly_segments$wind_speed <- NA
+hourly_segments$wind_dir   <- NA
+hourly_segments$wind_alfa  <- NA
+
+for (yr in 2020:2026) {
+  for (mo in 1:12) {
+    
+    filename <- paste0("era5_wind925_sahara_", yr, sprintf("%02d", mo), ".nc")
+    if (!file.exists(filename)) next
+    
+    nc         <- nc_open(filename)
+    lon        <- ncvar_get(nc, "longitude")
+    lat        <- ncvar_get(nc, "latitude")
+    valid_time <- ncvar_get(nc, "valid_time")
+    u          <- drop(ncvar_get(nc, "u"))
+    v          <- drop(ncvar_get(nc, "v"))
+    nc_close(nc)
+    
+    dates <- as.POSIXct(valid_time, origin = "1970-01-01", tz = "UTC")
+    
+    idx_seg <- which(format(hourly_segments$hour, "%Y%m") == sprintf("%d%02d", yr, mo))
+    if (length(idx_seg) == 0) { rm(u, v, dates, valid_time); gc(); next }
+    
+    for (i in idx_seg) {
+      
+      t_seg <- hourly_segments$hour[i]
+      idx_t <- which(dates == t_seg)
+      if (length(idx_t) == 0) idx_t <- which(abs(as.numeric(dates) - as.numeric(t_seg)) <= 3600)
+      if (length(idx_t) == 0) next
+      
+      # Trouver l'index lon et lat les plus proches séparément
+      best_lon <- which.min(abs(lon - hourly_segments$first_lon[i]))
+      best_lat <- which.min(abs(lat - hourly_segments$first_lat[i]))
+      
+      uw <- u[best_lon, best_lat, idx_t[1]]
+      vw <- v[best_lon, best_lat, idx_t[1]]
+      
+      hourly_segments$uwnd[i]       <- uw
+      hourly_segments$vwnd[i]       <- vw
+      hourly_segments$wind_speed[i] <- sqrt(uw^2 + vw^2)
+      hourly_segments$wind_dir[i]   <- atan2(vw, uw) * 180 / pi
+      hourly_segments$wind_alfa[i]  <- 90 - (atan2(vw, uw) * 180 / pi)
+    }
+    
+    rm(u, v, dates, valid_time)
+    gc()
+    cat("✓ Traité :", yr, sprintf("%02d", mo), "\n")
+  }
+}
+summary(hourly_segments$uwnd)
+summary(hourly_segments$vwnd)
+```
+
+### 2. Climatologie ("prevailing")
+
+```{r}
+library(ncdf4)
+
+season <- "autumn"  # ou "spring"
+season_months <- if (season == "autumn") 8:12 else 1:7
+
+u_count_west <- NULL  # cumul du nb de pas de temps avec U<0, par cellule
+n_count      <- NULL  # cumul du nb de pas de temps valides, par cellule
+grid_lon <- NULL
+grid_lat <- NULL
+
+for (yr in 2020:2026) {
+  for (mo in season_months) {
+
+    filename <- paste0("era5_wind925_sahara_", yr, sprintf("%02d", mo), ".nc")
+    if (!file.exists(filename)) next
+
+    nc  <- nc_open(filename)
+    lon <- ncvar_get(nc, "longitude")
+    lat <- ncvar_get(nc, "latitude")
+    u   <- drop(ncvar_get(nc, "u"))  # dims : lon, lat, time
+    nc_close(nc)
+
+    if (is.null(grid_lon)) {
+      grid_lon <- lon
+      grid_lat <- lat
+      u_count_west <- array(0, dim = c(length(lon), length(lat)))
+      n_count      <- array(0, dim = c(length(lon), length(lat)))
+    }
+
+    u_count_west <- u_count_west + apply(u < 0, c(1, 2), sum, na.rm = TRUE)
+    n_count      <- n_count      + apply(!is.na(u), c(1, 2), sum)
+
+    rm(u)
+    gc()
+    cat("✓ Climato traitée :", yr, sprintf("%02d", mo), "\n")
+  }
+}
+
+freq_west <- u_count_west / n_count
+freq_east <- 1 - freq_west
+
+clim_df <- expand.grid(lon = grid_lon, lat = grid_lat) %>%
+  mutate(
+    freq_west = as.vector(freq_west),
+    freq_east = as.vector(freq_east)
+  )
+```
+
+## Calculs finaux
+
+### Forward_speed & Perpendicular_speed
+
+```{r}
+
+#### Hourly_segments
+deg2rad <- function(x) x * pi / 180
+
+# Forward speed
+hourly_segments <- hourly_segments %>%
+  mutate(
+    forward_speed = segment_speed * cos(deg2rad(theta_reference - theta_segment))
+  )
+
+# Perpendicular speed
+hourly_segments <- hourly_segments %>%
+  mutate(
+    perpendicular_speed = -segment_speed * sin(deg2rad(theta_reference - theta_segment))
+  )
+
+```
+
+### Tailwind & Crosswind
+
+```{r}
+
+#Tailwind = wind speed × cos(θ_reference – θ_wind) 
+#Crosswind = – wind speed × sin(θ_reference – θ_wind) 
+# => Drift ratio (DR) (perpendicular speed / crosswind)
+
+
+# Rq : On va changer un peu cette méthode : on a déjà les vecteurs de vent uwnd et vwnd donc on peut faire une version vectorielle
+
+# Direction des oiseaux
+deg2rad <- function(x) x * pi / 180
+
+hourly_segments <- hourly_segments %>%
+  mutate(theta_rad = deg2rad(theta_reference))
+
+# Vecteur directeur de l'oiseau
+hourly_segments <- hourly_segments %>%
+  mutate(
+    ux = sin(theta_rad),
+    uy = cos(theta_rad)
+  )
+
+## 
+# Tailwind (projection du vent sur la trajectoire)
+hourly_segments <- hourly_segments %>%
+  mutate(
+    tailwind = uwnd * ux + vwnd * uy
+  )
+# Crosswind (composante perpendiculaire)
+hourly_segments <- hourly_segments %>%
+  mutate(
+    crosswind = -uwnd * uy + vwnd * ux
+  )
+
+
+## Vérifications
+summary(hourly_segments[, c("perpendicular_speed", "crosswind")])
+head(hourly_segments[, c("perpendicular_speed", "crosswind")])
+```
+
+### Drift_ratio
+
+```{r}
+# Vérifications
+summary(hourly_segments$theta_segment)
+summary(hourly_segments$crosswind)
+summary(hourly_segments$tailwind)
+
+# Calcul drift_ratio
+hourly_segments <- hourly_segments %>%
+  mutate(
+    drift_ratio = perpendicular_speed / crosswind
+  )
+
+# Sinon, pour fonctionner comme Vansteelant voir suite
+
+################################################################################
+####        CLASSIFY COMPENSATION BASED ON U COMP MOVE AND WIND         ########
+################################################################################
+
+# Vansteelant| Alice                 |
+# ---------- | --------------------- |
+# spd.sw     | `perpendicular_speed` |
+# sidewind   | `crosswind`           |
+
+
+hourly_segments$stw <- hourly_segments$perpendicular_speed/hourly_segments$crosswind
+hourly_segments$comp <- rep('0')
+hourly_segments[which(abs(hourly_segments$crosswind)*3.6 < 5),]$comp <- 'NSW'
+hourly_segments[which(abs(hourly_segments$crosswind)*3.6 < 5 & sign(hourly_segments$crosswind) == sign(hourly_segments$perpendicular_speed) & abs(hourly_segments$perpendicular_speed)*3.6 >= 5),]$comp <- 'OD'
+hourly_segments[which(abs(hourly_segments$crosswind)*3.6 < 5 & sign(hourly_segments$crosswind) != sign(hourly_segments$perpendicular_speed) & abs(hourly_segments$perpendicular_speed)*3.6 >= 5),]$comp <- 'OC'
+hourly_segments[which(abs(hourly_segments$crosswind)*3.6 >= 5 & abs(hourly_segments$stw) <= 0.2),]$comp <- 'FC'
+hourly_segments[which(abs(hourly_segments$crosswind)*3.6 >= 5 & sign(hourly_segments$crosswind) == sign(hourly_segments$perpendicular_speed) & abs(hourly_segments$stw) > 0.2 & abs(hourly_segments$stw) < 0.8),]$comp <- 'PC'
+hourly_segments[which(abs(hourly_segments$crosswind)*3.6 >= 5 & sign(hourly_segments$crosswind) != sign(hourly_segments$perpendicular_speed) & abs(hourly_segments$stw) > 0.2 & abs(hourly_segments$stw) < 0.8),]$comp <- 'OC'
+hourly_segments[which(abs(hourly_segments$crosswind)*3.6 >= 5 & sign(hourly_segments$crosswind) == sign(hourly_segments$perpendicular_speed) & abs(hourly_segments$stw) >= 0.8 & abs(hourly_segments$stw) < 1.2),]$comp <- 'FD'
+hourly_segments[which(abs(hourly_segments$crosswind)*3.6 >= 5 & sign(hourly_segments$crosswind) != sign(hourly_segments$perpendicular_speed) & abs(hourly_segments$stw) >= 0.8 & abs(hourly_segments$stw) < 1.2),]$comp <- 'OC'
+hourly_segments[which(abs(hourly_segments$crosswind)*3.6 >= 5 & sign(hourly_segments$crosswind) == sign(hourly_segments$perpendicular_speed) & abs(hourly_segments$stw) >= 1.2),]$comp <- 'OD'
+hourly_segments[which(abs(hourly_segments$crosswind)*3.6 >= 5 & sign(hourly_segments$crosswind) != sign(hourly_segments$perpendicular_speed) & abs(hourly_segments$perpendicular_speed) >= 1.2),]$comp <- 'OC' 
+
+
+
+# "Orientation responses were classified as 
+#over-drift (DO, i.e. heading downwind from the GCR), 
+#full drift (DF), 
+#partial (CP) or 
+#full compensatation (CF, i.e. staying on the GCR through sidewinds), #overcompensation (CO, i.e. heading upwind the GCR). 
+#Cases where falcons stayed on the GCR in absence of sidewinds were not classified (NSW)
+unique(hourly_segments$comp)
+hourly_segments$comp <- as.factor(hourly_segments$comp)
+table(hourly_segments$comp)
+
+hourly_segments <- hourly_segments %>%
+  mutate(MIGRATION = sub(".*_(autumn|spring)_\\d{4}$", "\\1", track_ID))
+unique(hourly_segments$MIGRATION)
+
+table(hourly_segments$comp[hourly_segments$MIGRATION == "spring"])
+table(hourly_segments$comp[hourly_segments$MIGRATION == "autumn"])
+
+
+str(hourly_segments)
+summary(hourly_segments)
+```
+
+## Chi-deux : Proportions par groupes d'age
+
+```{r}
+str(hourly_segments)
+
+#### Distribution des comportements de compensation (comp) : age x saison ####
+
+## 1. Tableau de comptage et de proportions
+comp_summary <- hourly_segments %>%
+  count(MIGRATION, age_group, comp) %>%
+  group_by(MIGRATION, age_group) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+comp_summary
+
+## 2. Barplot empilé en proportions, facetté par saison
+p_comp <- ggplot(comp_summary, aes(x = age_group, y = prop, fill = comp)) +
+  geom_col(position = "fill") +
+  facet_wrap(~ MIGRATION) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Répartition des comportements de compensation au vent",
+    subtitle = "Par classe d'âge et saison de migration",
+    x = NULL, y = "Proportion", fill = "Comportement"
+  ) +
+  theme_minimal()
+
+p_comp
+
+## 3. Version alternative : barres côte à côte (comptages bruts, pas proportions)
+p_comp_counts <- ggplot(comp_summary, aes(x = comp, y = n, fill = age_group)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ MIGRATION) +
+  labs(
+    x = "Drift/Compensation behavior", y = "Number of hourly segments", fill = "Experience"
+  ) +
+  theme_minimal()
+
+p_comp_counts
+
+## 4. Test du chi² : la distribution de comp diffère-t-elle entre juvéniles et adultes, par saison ?
+chisq_autumn <- hourly_segments %>%
+  filter(MIGRATION == "autumn") %>%
+  { chisq.test(table(.$age_group, .$comp)) }
+chisq_autumn
+
+chisq_spring <- hourly_segments %>%
+  filter(MIGRATION == "spring") %>%
+  { chisq.test(table(.$age_group, .$comp)) }
+chisq_spring
+
+hourly_segments <- hourly_segments %>%
+  mutate(group4 = paste(age_group, MIGRATION, sep = "_"))
+# ex : "adult_autumn", "adult_spring", "juvenile_autumn", "juvenile_spring"
+
+chisq_4groups <- chisq.test(table(hourly_segments$group4, hourly_segments$comp))
+chisq_4groups
+
+
+
+
+
+#### Distribution des comportements de compensation (comp) : effet de la saison ####
+library(rcompanion)
+
+## 5. Test du chi² global : la distribution de comp diffère-t-elle entre saisons (tous individus confondus) ?
+chisq_season_global <- chisq.test(table(hourly_segments$MIGRATION, hourly_segments$comp))
+chisq_season_global
+
+cramerV(table(hourly_segments$MIGRATION, hourly_segments$comp))
+
+## 6. Effet de la saison, séparément pour chaque classe d'âge
+chisq_season_juv <- hourly_segments %>%
+  filter(age_group == "juvenile") %>%
+  { chisq.test(table(.$MIGRATION, .$comp)) }
+chisq_season_juv
+
+chisq_season_adult <- hourly_segments %>%
+  filter(age_group == "adult") %>%
+  { chisq.test(table(.$MIGRATION, .$comp)) }
+chisq_season_adult
+
+## 7. Comparaisons ciblées par paires (post-hoc), avec correction pour tests multiples
+# On compare : juvenile_autumn vs juvenile_spring, adult_autumn vs adult_spring,
+# ainsi que autumn (juv vs adult) et spring (juv vs adult) déjà faits plus haut (chisq_autumn / chisq_spring)
+
+pairwise_tests <- list(
+  "juvenile: autumn vs spring" = hourly_segments %>%
+    filter(age_group == "juvenile") %>%
+    { chisq.test(table(.$MIGRATION, .$comp)) },
+  "adult: autumn vs spring" = hourly_segments %>%
+    filter(age_group == "adult") %>%
+    { chisq.test(table(.$MIGRATION, .$comp)) },
+  "autumn: adult vs juvenile" = chisq_autumn,
+  "spring: adult vs juvenile" = chisq_spring
+)
+
+# Extraction des p-values et correction (Holm, plus puissant que Bonferroni)
+pvals_raw <- sapply(pairwise_tests, function(x) x$p.value)
+pvals_adj <- p.adjust(pvals_raw, method = "holm")
+
+pairwise_results <- data.frame(
+  comparison = names(pairwise_tests),
+  chi2 = sapply(pairwise_tests, function(x) round(x$statistic, 2)),
+  df = sapply(pairwise_tests, function(x) x$parameter),
+  p_raw = round(pvals_raw, 4),
+  p_holm = round(pvals_adj, 4)
+)
+
+pairwise_results
+```
+
+Représentation
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+# ================================
+# PALETTE ET LABELS
+# ================================
+comp_colors <- c(
+  "FC"  = "orange",      # Full compensation
+  "PC"  = "yellow",      # Partial compensation
+  "FD"  = "skyblue3",    # Full drift
+  "OD"  = "blue1",       # Over drift
+  "OC"  = "red",         # Over compensation
+  "NSW" = "#bababa",     # No sidewind
+  "0"   = "#ffffff"      # Non classifié
+)
+
+# Adapte les labels d'âge : remplace "adult"/"juvenile" par les vraies valeurs de ta colonne
+age_labels <- c("adult" = "\u2265 5 yrs", "juvenile" = "\u2264 3 yrs")  # ajuste les clés si besoin
+
+# ================================
+# 1. TABLEAU DE COMPTAGE ET PROPORTIONS
+# ================================
+comp_summary <- hourly_segments %>%
+  count(MIGRATION, age_group, comp) %>%
+  group_by(MIGRATION, age_group) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+comp_summary
+
+# ================================
+# 2. FIGURE PRINCIPALE
+# ================================
+p_comp <- ggplot(comp_summary, aes(x = age_group, y = prop, fill = comp)) +
+  geom_col(position = "fill", width = 0.65, color = "white", linewidth = 0.3) +
+  facet_wrap(~ MIGRATION, labeller = labeller(MIGRATION = c(autumn = "Autumn", spring = "Spring"))) +
+  scale_x_discrete(labels = age_labels) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_manual(values = comp_colors) +
+  labs(
+    x = NULL,
+    y = "Proportion of hourly segments",
+    fill = "Drift/Compensation\nbehavior"
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, hjust = 0),
+    strip.text = element_text(face = "bold", size = 15),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 15),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 15),
+    legend.key.size = unit(1.1, "lines"),
+    panel.grid.major.x = element_blank(),
+    legend.position = "right"
+  )
+p_comp
+
+ggsave(
+  "C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/Figures principales/comp.png",
+  p_comp, width = 10, height = 5, dpi = 300
+)
+
+
+# ================================
+# 3. TESTS DU CHI²
+# ================================
+chisq_autumn <- hourly_segments %>%
+  filter(MIGRATION == "autumn") %>%
+  { chisq.test(table(.$age_group, .$comp)) }
+chisq_autumn
+
+chisq_spring <- hourly_segments %>%
+  filter(MIGRATION == "spring") %>%
+  { chisq.test(table(.$age_group, .$comp)) }
+chisq_spring
+
+# ================================
+# 4. HEATMAP DES RÉSIDUS STANDARDISÉS
+# ================================
+resid_autumn <- as.data.frame(as.table(chisq_autumn$stdres)) %>%
+  rename(age_group = Var1, comp = Var2, std_resid = Freq) %>%
+  mutate(MIGRATION = "Autumn")
+
+resid_spring <- as.data.frame(as.table(chisq_spring$stdres)) %>%
+  rename(age_group = Var1, comp = Var2, std_resid = Freq) %>%
+  mutate(MIGRATION = "Spring")
+
+resid_all <- bind_rows(resid_autumn, resid_spring)
+
+p_resid <- ggplot(resid_all, aes(x = comp, y = age_group, fill = std_resid)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(std_resid, 1)), size = 5, color = "black") +
+  facet_wrap(~ MIGRATION) +
+  scale_y_discrete(labels = age_labels) +
+  scale_fill_gradient2(
+    low = "#B35A00", mid = "white", high = "#2E5E2E",
+    midpoint = 0, name = "Standardized\nresidual"
+  ) +
+  labs(
+    subtitle = "Values > |2| indicate cells contributing most to the association",
+    x = "Wind drift compensation behavior",
+    y = "Experience"
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, hjust = 0),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "grey30"),
+    strip.text = element_text(face = "bold", size = 15),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 13),
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 15),
+    legend.key.size = unit(1.1, "lines")
+  )
+p_resid
+
+ggsave(
+  "C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/ANNEXES/comp_behaviour_chisq_exp.png",
+  p_resid, width = 10, height = 6, dpi = 300
+)
+```
+
+Heatmap effet de la saison sur comp
+
+```{r}
+# ================================
+# 6. HEATMAP DES RÉSIDUS STANDARDISÉS — EFFET SAISON
+# ================================
+
+# Résidus pour les juvéniles (autumn vs spring)
+resid_juv <- as.data.frame(as.table(chisq_season_juv$stdres)) %>%
+  rename(MIGRATION = Var1, comp = Var2, std_resid = Freq) %>%
+  mutate(age_group = "juvenile")
+
+# Résidus pour les adultes (autumn vs spring)
+resid_adult <- as.data.frame(as.table(chisq_season_adult$stdres)) %>%
+  rename(MIGRATION = Var1, comp = Var2, std_resid = Freq) %>%
+  mutate(age_group = "adult")
+
+resid_season_all <- bind_rows(resid_juv, resid_adult) %>%
+  mutate(MIGRATION = recode(MIGRATION, "autumn" = "Autumn", "spring" = "Spring"))
+
+p_resid_season <- ggplot(resid_season_all, aes(x = comp, y = MIGRATION, fill = std_resid)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(std_resid, 1)), size = 5, color = "black") +
+  facet_wrap(~ age_group, labeller = labeller(age_group = age_labels)) +
+  scale_fill_gradient2(
+    low = "#B35A00", mid = "white", high = "#2E5E2E",
+    midpoint = 0, name = "Standardized\nresidual"
+  ) +
+  labs(
+    subtitle = "Values > |2| indicate cells contributing most to the season effect",
+    x = "Drift/Compensation behavior",
+    y = "Season"
+  ) +
+  theme_minimal(base_size = 18) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, hjust = 0),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "grey30"),
+    strip.text = element_text(face = "bold", size = 15),
+    axis.title = element_text(size = 15),
+    axis.text = element_text(size = 13),
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 15),
+    legend.key.size = unit(1.1, "lines")
+  )
+p_resid_season
+
+# ================================
+# 7. SAUVEGARDE (annexe)
+# ================================
+final_resid_season_plot <- p_resid_season +
+  plot_annotation(
+    caption = paste0(
+      "Juvenile: \u03c7\u00b2 = ", round(chisq_season_juv$statistic, 2),
+      ", df = ", chisq_season_juv$parameter,
+      ", p = ", round(chisq_season_juv$p.value, 3), ". ",
+      "Adult: \u03c7\u00b2 = ", round(chisq_season_adult$statistic, 2),
+      ", df = ", chisq_season_adult$parameter,
+      ", p = ", round(chisq_season_adult$p.value, 3), "."
+    ),
+    theme = theme(plot.caption = element_text(size = 11, hjust = 0.5, color = "grey30", face = "italic"))
+  )
+final_resid_season_plot
+
+ggsave(
+  "C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/ANNEXES/comp_behaviour_chisq_season.png",
+  final_resid_season_plot, width = 10, height = 6, dpi = 300
+)
+```
+
+### BLOC DE COEFFICIENTS
+
+```{r}
+# Bloc de coefficients pour le texte 
+
+
+# N
+hourly_segments$age_group <- as.factor (hourly_segments$age_group )
+summary(hourly_segments)
+summary(winds)
+
+# EXPERIENCE
+
+library(rcompanion)
+
+## Autumn
+cat("=== AUTUMN ===\n")
+print(chisq_autumn)
+cat("Cramér's V (autumn):\n")
+print(cramerV(table(hourly_segments$age_group[hourly_segments$MIGRATION == "autumn"],
+                     hourly_segments$comp[hourly_segments$MIGRATION == "autumn"])))
+
+## Spring
+cat("\n=== SPRING ===\n")
+print(chisq_spring)
+cat("Cramér's V (spring):\n")
+print(cramerV(table(hourly_segments$age_group[hourly_segments$MIGRATION == "spring"],
+                     hourly_segments$comp[hourly_segments$MIGRATION == "spring"])))
+
+## Résidus standardisés (pour vérifier qu'aucune cellule ne dépasse |2|)
+cat("\n=== RÉSIDUS STANDARDISÉS (autumn) ===\n")
+print(round(chisq_autumn$stdres, 2))
+
+cat("\n=== RÉSIDUS STANDARDISÉS (spring) ===\n")
+print(round(chisq_spring$stdres, 2))
+
+## Effectifs par cellule (utile pour vérifier la validité du test, ex. effectifs attendus < 5)
+cat("\n=== EFFECTIFS ATTENDUS (autumn) ===\n")
+print(round(chisq_autumn$expected, 1))
+
+cat("\n=== EFFECTIFS ATTENDUS (spring) ===\n")
+print(round(chisq_spring$expected, 1))
+
+
+# SEASON
+
+library(rcompanion)
+
+## Juvenile: autumn vs spring
+cat("=== JUVENILE (season effect) ===\n")
+print(chisq_season_juv)
+cat("Cramér's V (juvenile):\n")
+print(cramerV(table(hourly_segments$MIGRATION[hourly_segments$age_group == "juvenile"],
+                     hourly_segments$comp[hourly_segments$age_group == "juvenile"])))
+
+## Adult: autumn vs spring
+cat("\n=== ADULT (season effect) ===\n")
+print(chisq_season_adult)
+cat("Cramér's V (adult):\n")
+print(cramerV(table(hourly_segments$MIGRATION[hourly_segments$age_group == "adult"],
+                     hourly_segments$comp[hourly_segments$age_group == "adult"])))
+
+## Résidus standardisés
+cat("\n=== RÉSIDUS STANDARDISÉS (juvenile) ===\n")
+print(round(chisq_season_juv$stdres, 2))
+
+cat("\n=== RÉSIDUS STANDARDISÉS (adult) ===\n")
+print(round(chisq_season_adult$stdres, 2))
+
+## Effectifs attendus (vérification de validité)
+cat("\n=== EFFECTIFS ATTENDUS (juvenile) ===\n")
+print(round(chisq_season_juv$expected, 1))
+
+cat("\n=== EFFECTIFS ATTENDUS (adult) ===\n")
+print(round(chisq_season_adult$expected, 1))
+```
+
+### Panel a
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+comp_colors <- c(
+  "FC"  = "orange",      # Full compensation
+  "PC"  = "yellow",      # Partial compensation
+  "FD"  = "skyblue3",    # Full drift
+  "OD"  = "blue1",       # Over drift
+  "OC"  = "red",         # Over compensation
+  "NSW" = "#bababa",     # No sidewind
+  "0"   = "#ffffff"      # Non classifié
+)
+
+
+lat_breaks <- seq(15, 35, by = 2)  # adapte selon l'étendue réelle de first_lat
+
+hourly_segments <- hourly_segments %>%
+  mutate(lat_bin = cut(first_lat, breaks = lat_breaks, include.lowest = TRUE))
+
+freq_by_lat <- hourly_segments %>%
+  filter(MIGRATION == "autumn") %>%
+  count(lat_bin, comp) %>%
+  group_by(lat_bin) %>%
+  mutate(freq = n / sum(n)) %>%
+  ungroup()
+
+panel_a <- ggplot(freq_by_lat, aes(x = lat_bin, y = freq, fill = comp)) +
+  geom_col(position = "stack") +
+  scale_fill_manual(values = comp_colors) +
+  coord_flip() +  # bandes de latitude empilées horizontalement, comme dans Vansteelant
+  labs(x = "Latitude band (°)", y = "Relative frequency", fill = "Drift/Compensation behavior") +
+  theme_minimal()
+
+panel_a
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(patchwork)
+
+lat_breaks <- seq(15, 35, by = 2)  # adapte selon l'étendue réelle de first_lat
+
+# Binning une seule fois, pas besoin de le refaire par saison
+hourly_segments <- hourly_segments %>%
+  mutate(lat_bin = cut(first_lat, breaks = lat_breaks, include.lowest = TRUE))
+
+#### Fonction pour générer le panel A par saison ####
+make_panel_a <- function(season) {
+  
+  freq_by_lat <- hourly_segments %>%
+    filter(MIGRATION == season) %>%
+    count(lat_bin, comp) %>%
+    group_by(lat_bin) %>%
+    mutate(freq = n / sum(n)) %>%
+    ungroup()
+  
+  ggplot(freq_by_lat, aes(x = lat_bin, y = freq, fill = comp)) +
+    geom_col(position = "stack") +
+    scale_fill_manual(values = comp_colors) +
+    coord_flip() +
+    labs(
+      x = "Latitude band (°)",
+      y = "Relative frequency",
+      fill = "Drift/Compensation behavior",
+      title = season
+    ) +
+    theme_minimal(base_size = 18) +
+    theme(
+      axis.title = element_text(size = 18),
+      axis.text  = element_text(size = 13),
+      plot.title = element_text(size = 18, face = "bold")
+    )
+}
+
+#### Boucle sur toutes les saisons ####
+seasons <- unique(hourly_segments$MIGRATION)
+conflicts_prefer(purrr::map)
+conflicts_prefer(dplyr::filter)
+
+panels_a_by_season <- map(seasons, make_panel_a) %>% 
+  setNames(seasons)
+
+#### Combinaison côte à côte avec légende unique ####
+combined_panel_a <- wrap_plots(panels_a_by_season, nrow = 1) +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    legend.text  = element_text(size = 15),
+    legend.title = element_text(size = 16)
+  )
+
+combined_panel_a
+
+#### Sauvegarde de la figure combinée ####
+ggsave(
+  "C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/Figures principales/panel_a_all_seasons.png",
+  plot = combined_panel_a,
+  width = 12, height = 5, dpi = 300
+)
+```
+
+## Chi-squared comp par rapport au comp de tout le flyway
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(flextable)
+library(officer)
+
+# ================================
+# 1. REGROUPEMENT DES CATEGORIES
+# ================================
+hourly_segments <- hourly_segments %>%
+  mutate(comp_group = case_when(
+    comp == "OC" ~ "OC",
+    comp == "OD" ~ "OD",
+    TRUE ~ "Other"
+  ))
+
+# ================================
+# 2. FRÉQUENCE MOYENNE ATTENDUE SUR TOUT LE FLYWAY (par saison)
+# ================================
+expected_freq <- hourly_segments %>%
+  filter(!is.na(lat_bin)) %>%
+  count(MIGRATION, comp_group) %>%
+  group_by(MIGRATION) %>%
+  mutate(expected_pct = 100 * n / sum(n)) %>%
+  ungroup() %>%
+  select(MIGRATION, comp_group, expected_pct)
+
+expected_freq
+
+# ================================
+# 3. FRÉQUENCE OBSERVÉE PAR BANDE DE LATITUDE
+# ================================
+observed_freq <- hourly_segments %>%
+  filter(!is.na(lat_bin)) %>%
+  count(MIGRATION, lat_bin, comp_group) %>%
+  group_by(MIGRATION, lat_bin) %>%
+  mutate(
+    total_band = sum(n),
+    observed_pct = 100 * n / total_band
+  ) %>%
+  ungroup()
+
+# ================================
+# 4. TEST DU CHI² PAR BANDE (bande vs reste, classe vs reste)
+#    -> détermine si la bande a significativement PLUS que la moyenne attendue
+# ================================
+test_significance <- function(migration_val, lat_bin_val, group_val) {
+  
+  df_season <- hourly_segments %>% filter(MIGRATION == migration_val, !is.na(lat_bin))
+  
+  in_band   <- df_season$lat_bin == lat_bin_val
+  is_group  <- df_season$comp_group == group_val
+  
+  tbl <- table(in_band, is_group)
+  
+  if (nrow(tbl) < 2 || ncol(tbl) < 2) return(list(p = NA, higher = FALSE))
+  
+  test <- suppressWarnings(chisq.test(tbl))
+  
+  # Est-ce que la proportion observée dans la bande est SUPÉRIEURE à l'attendu ?
+  obs_pct_band <- 100 * sum(in_band & is_group) / sum(in_band)
+  exp_pct_all  <- 100 * sum(is_group) / length(is_group)
+  
+  higher <- obs_pct_band > exp_pct_all
+  
+  list(p = test$p.value, higher = higher)
+}
+
+# Appliquer le test pour chaque combinaison bande x saison x groupe (OC et OD seulement, comme l'article)
+sig_results <- observed_freq %>%
+  filter(comp_group %in% c("OC", "OD")) %>%
+  distinct(MIGRATION, lat_bin, comp_group) %>%
+  rowwise() %>%
+  mutate(
+    test = list(test_significance(MIGRATION, lat_bin, comp_group)),
+    p_value = test$p,
+    higher_than_expected = test$higher,
+    significant = !is.na(p_value) & p_value < 0.05 & higher_than_expected
+  ) %>%
+  ungroup() %>%
+  select(MIGRATION, lat_bin, comp_group, significant)
+
+sig_results
+
+# ================================
+# 5. FRÉQUENCES RÉSIDUELLES (observed - expected)
+# ================================
+table_data <- observed_freq %>%
+  left_join(expected_freq, by = c("MIGRATION", "comp_group")) %>%
+  mutate(residual_pct = round(observed_pct - expected_pct, 1)) %>%
+  left_join(sig_results, by = c("MIGRATION", "lat_bin", "comp_group")) %>%
+  mutate(significant = ifelse(is.na(significant), FALSE, significant))
+
+table_data
+
+
+# ================================
+# EXPORT
+# ================================
+library(writexl)   # export Excel simple
+library(flextable)
+library(officer)
+
+# Chemin du dossier
+dir_supp <- "C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/Elements supplémentaires/"
+
+# ================================
+# OPTION 1 : Export simple en Excel (.xlsx) — pratique pour vérifier/manipuler les données
+# ================================
+write_xlsx(
+  table_data,
+  path = paste0(dir_supp, "table_data_lat_compensation_detail.xlsx")
+)
+
+# ================================
+# OPTION 2 : Export en Word (.docx) via flextable — cohérent avec ton style de rapport
+# ================================
+ft_detail <- flextable(table_data) %>%
+  theme_vanilla() %>%
+  align(align = "center", part = "all") %>%
+  bold(part = "header") %>%
+  autofit()
+
+ft_detail
+
+doc_detail <- read_docx() %>%
+  body_add_flextable(ft_detail)
+
+print(doc_detail, target = paste0(dir_supp, "table_data_lat_compensation_detail.docx"))
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(flextable)
+library(officer)
+
+# ================================
+# TABLEAU LARGE : une colonne par saison x groupe
+# ================================
+table_wide <- table_data %>%
+  select(MIGRATION, lat_bin, comp_group, residual_pct) %>%
+  pivot_wider(
+    names_from = c(MIGRATION, comp_group),
+    values_from = residual_pct
+  ) %>%
+  arrange(desc(lat_bin)) %>%
+  # Réordonne les colonnes exactement comme le tableau modèle : OC, Other, OD par saison
+  select(
+    lat_bin,
+    autumn_OC, autumn_Other, autumn_OD,
+    spring_OC, spring_Other, spring_OD
+  )
+
+table_wide
+
+# ================================
+# FLEXTABLE avec en-têtes groupés Autumn / Spring
+# ================================
+ft <- flextable(table_wide) %>%
+  set_header_labels(
+    lat_bin     = "Latitude [\u00b0]",
+    autumn_OC   = "OC",
+    autumn_Other = "Other",
+    autumn_OD   = "OD",
+    spring_OC   = "OC",
+    spring_Other = "Other",
+    spring_OD   = "OD"
+  ) %>%
+  add_header_row(
+    values = c("", "Autumn", "", "", "Spring", "", ""),
+    top = TRUE
+  ) %>%
+  merge_at(i = 1, j = 2:4, part = "header") %>%
+  merge_at(i = 1, j = 5:7, part = "header") %>%
+  merge_at(i = 1:2, j = 1, part = "header") %>%
+  theme_vanilla() %>%
+  align(align = "center", part = "all") %>%
+  bold(part = "header") %>%
+  border_remove() %>%
+  hline_top(part = "header", border = fp_border(width = 1.5)) %>%
+  hline(i = 1, part = "header", border = fp_border(width = 0.75)) %>%
+  hline_bottom(part = "header", border = fp_border(width = 1.5)) %>%
+  hline_bottom(part = "body", border = fp_border(width = 1.5)) %>%
+  autofit()
+
+ft
+
+# ================================
+# MISE EN GRAS DES VALEURS SIGNIFICATIVES (OC et OD uniquement)
+# ================================
+sig_wide <- table_data %>%
+  select(MIGRATION, lat_bin, comp_group, significant) %>%
+  pivot_wider(names_from = c(MIGRATION, comp_group), values_from = significant) %>%
+  arrange(desc(lat_bin))
+
+# Applique le gras colonne par colonne pour OC et OD (Autumn et Spring)
+for (col in c("autumn_OC", "autumn_OD", "spring_OC", "spring_OD")) {
+  rows_bold <- which(sig_wide[[col]] == TRUE)
+  if (length(rows_bold) > 0) {
+    ft <- bold(ft, i = rows_bold, j = col, bold = TRUE, part = "body")
+  }
+}
+
+ft
+
+# ================================
+# EXPORT WORD
+# ================================
+doc <- read_docx() %>%
+  body_add_flextable(ft)
+
+print(doc, target = "C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/table_lat_compensation_residuals.docx")
+
+# Ajoute la légende sous le tableau dans ton document final
+```
+
+```{r}
+#| eval: false
+#| include: false
+# Code coeff pour texte résulats
+
+library(dplyr)
+
+## Table finale avec résidu (observed - expected) + p-value, uniquement OC/OD
+summary_table <- table_data %>%
+  select(-any_of(c("significant", "p_value"))) %>%   # retire les colonnes en doublon avant la jointure
+  filter(comp_group %in% c("OC", "OD")) %>%
+  left_join(sig_results_full, by = c("MIGRATION", "lat_bin", "comp_group")) %>%
+  select(MIGRATION, lat_bin, comp_group, residual_pct, p_value, significant) %>%
+  arrange(MIGRATION, comp_group, desc(lat_bin))
+
+print(summary_table, n = Inf)
+
+## Filtre : uniquement les bandes significativement AU-DESSUS de la moyenne (celles à citer dans le texte)
+cat("\n=== BANDES SIGNIFICATIVES (OC/OD > moyenne du flyway) ===\n")
+summary_table %>%
+  filter(significant == TRUE) %>%
+  print(n = Inf)
+```
+
+### Ecriture csv
+
+```{r}
+#write.csv(hourly_segments, 
+#          here("Alice/Data_analysis_June_2026/Analyses/hourly_segments.csv"), 
+#          row.names = FALSE)
+```
+
+### Autre
+
+```{r}
+#Finally, the airspeed and heading of the flying bird could be derived from the track and wind 
+#vector, by:  
+#●      Track vector = segment speed x  [c𝑜𝑠 θ 𝑠𝑒𝑔𝑚𝑒𝑛𝑡//𝑠𝑖𝑛 θ 𝑠𝑒𝑔𝑚𝑒𝑛𝑡]
+#●      Wind vector = wind speed ×  [𝑐𝑜𝑠 θ 𝑤𝑖𝑛𝑑 // 𝑠𝑖𝑛 θ 𝑤𝑖𝑛𝑑]
+#●      => Airspeed = track vector – wind vector : On a déjà un calcul de vair mais bon. Peut être que c'est pas dérangeant
+#●      Heading = atan2(y component of the airspeed, x component of the airspeed) 
+```
+
+## Visualisation
+
+```{r}
+# Carte de fond
+world <- map_data("world")
+
+ggplot() +
+  geom_polygon(data = world,
+               aes(x = long, y = lat, group = group),
+               fill = "grey90", color = "grey60", linewidth = 0.2) +
+  geom_segment(data = hourly_segments,
+               aes(x = first_lon, y = first_lat,
+                   xend = last_lon, yend = last_lat,
+                   color = comp),
+               alpha = 0.6, linewidth = 0.5) +
+  scale_color_manual(values = comp_colors,
+                     labels = c("CF"  = "Full compensation",
+                                "CP"  = "Partial compensation",
+                                "DF"  = "Full drift",
+                                "DO"  = "Over drift",
+                                "CO"  = "Over compensation",
+                                "NSW" = "No sidewind",
+                                "0"   = "Unclassified")) +
+  coord_quickmap(xlim = c(-20, 2), ylim = c(17, 30)) +
+  theme_minimal() +
+  labs(title = "Drift/Compensation behavior — Hourly segments",
+       x = "Longitude", y = "Latitude",
+       color = "Drift/Compensation behavior") +
+  facet_wrap(~ MIGRATION)  # séparer printemps/automne
+
+
+
+##
+hourly_segments_spring <- subset(hourly_segments, MIGRATION == "spring")
+hourly_segments_autumn <- subset(hourly_segments, MIGRATION == "autumn")
+
+
+# spring
+ggplot() +
+  geom_polygon(data = world,
+               aes(x = long, y = lat, group = group),
+               fill = "grey90", color = "grey60", linewidth = 0.2) +
+  geom_segment(data = hourly_segments_spring,
+               aes(x = first_lon, y = first_lat,
+                   xend = last_lon, yend = last_lat,
+                   color = comp),
+               alpha = 0.6, linewidth = 0.5) +
+  scale_color_manual(values = comp_colors) +
+  coord_quickmap(xlim = c(-20, 2), ylim = c(17, 30)) +
+  theme_minimal() +
+  labs(title = "Spring — Drift/Compensation behavior",
+       x = "Longitude", y = "Latitude",
+       color = "Drift/Compensation behavior")
+
+# autumn
+ggplot() +
+  geom_polygon(data = world,
+               aes(x = long, y = lat, group = group),
+               fill = "grey90", color = "grey60", linewidth = 0.2) +
+  geom_segment(data = hourly_segments_autumn,
+               aes(x = first_lon, y = first_lat,
+                   xend = last_lon, yend = last_lat,
+                   color = comp),
+               alpha = 0.6, linewidth = 0.5) +
+  scale_color_manual(values = comp_colors) +
+  coord_quickmap(xlim = c(-20, 2), ylim = c(17, 30)) +
+  theme_minimal() +
+  labs(title = "Autumn — Drift/Compensation behavior",
+       x = "Longitude", y = "Latitude",
+       color = "Drift/Compensation behavior")
+```
+
+## Visualisation 2 = panel b
+
+```{r}
+# Séparer les segments selon le vent réellement rencontré (en route)
+hourly_segments_west <- hourly_segments %>% filter(MIGRATION == season, uwnd < 0)
+hourly_segments_east <- hourly_segments %>% filter(MIGRATION == season, uwnd >= 0)
+
+panel_b_west <- ggplot() +
+  geom_raster(data = clim_df, aes(x = lon, y = lat, fill = freq_west)) +
+  scale_fill_gradient(low = "darkseagreen", high = "darkorange", name = "Fréq. vent d'ouest") +
+  geom_point(data = hourly_segments_west,
+             aes(x = first_lon, y = first_lat, color = comp),
+             size = 0.6, alpha = 0.8) +
+  scale_color_manual(values = comp_colors, name = "Comportement") +
+  coord_quickmap(xlim = c(-20, 2), ylim = c(17, 30)) +
+  theme_minimal() +
+  labs(title = "Segments avec vent d'ouest rencontré en route")
+
+panel_b_east <- ggplot() +
+  geom_raster(data = clim_df, aes(x = lon, y = lat, fill = freq_east)) +
+  scale_fill_gradient(low = "darkseagreen", high = "darkorange", name = "Fréq. vent d'est") +
+  geom_point(data = hourly_segments_east,
+             aes(x = first_lon, y = first_lat, color = comp),
+             size = 0.6, alpha = 0.8) +
+  scale_color_manual(values = comp_colors, name = "Comportement") +
+  coord_quickmap(xlim = c(-20, 2), ylim = c(17, 30)) +
+  theme_minimal() +
+  labs(title = "Segments avec vent d'est rencontré en route")
+
+panel_b_west
+panel_b_east
+```
+
+```{r}
+#### Fonction pour générer les 2 panels par saison ####
+make_panels_b <- function(season) {
+  
+  hourly_segments_west <- hourly_segments %>% 
+    filter(MIGRATION == season, uwnd < 0)
+  hourly_segments_east <- hourly_segments %>% 
+    filter(MIGRATION == season, uwnd >= 0)
+  
+  panel_b_west <- ggplot() +
+    geom_raster(data = clim_df, aes(x = lon, y = lat, fill = freq_west)) +
+    scale_fill_gradient(low = "darkseagreen", high = "darkorange", name = "Fréq. vent d'ouest") +
+    geom_point(data = hourly_segments_west,
+               aes(x = first_lon, y = first_lat, color = comp),
+               size = 0.6, alpha = 0.8) +
+    scale_color_manual(values = comp_colors, name = "Comportement") +
+    coord_quickmap(xlim = c(-20, 2), ylim = c(17, 34)) +
+    theme_minimal() +
+    labs(title = paste0("Segments avec vent d'ouest rencontré en route — ", season))
+  
+  panel_b_east <- ggplot() +
+    geom_raster(data = clim_df, aes(x = lon, y = lat, fill = freq_east)) +
+    scale_fill_gradient(low = "darkseagreen", high = "darkorange", name = "Fréq. vent d'est") +
+    geom_point(data = hourly_segments_east,
+               aes(x = first_lon, y = first_lat, color = comp),
+               size = 0.6, alpha = 0.8) +
+    scale_color_manual(values = comp_colors, name = "Comportement") +
+    coord_quickmap(xlim = c(-20, 2), ylim = c(17, 34)) +
+    theme_minimal() +
+    labs(title = paste0("Segments avec vent d'est rencontré en route — ", season))
+  
+  list(west = panel_b_west, east = panel_b_east)
+}
+
+#### Boucle sur toutes les saisons ####
+seasons <- unique(hourly_segments$MIGRATION)
+
+panels_by_season <- purrr::map(seasons, make_panels_b) %>% 
+  setNames(seasons)
+
+# Affichage (utile en Quarto/RMarkdown : chaque print() sort dans le doc)
+for (s in seasons) {
+  print(panels_by_season[[s]]$west)
+  print(panels_by_season[[s]]$east)
+}
+```
+
+# Représentations et Modèles
+
+## Perpendicular speed plotted against crosswind
+
+```{r}
+# Par saison
+ggplot(hourly_segments,
+       aes(x = crosswind,
+           y = perpendicular_speed,
+           colour = comp)) +
+  geom_point(alpha = 0.7, size = 2) +
+  facet_wrap(~ MIGRATION) +
+  scale_colour_manual(values = comp_colors) +
+  theme_bw() +
+  labs(
+    x = "Crosswind (m/s)",
+    y = "Perpendicular speed (m/s)",
+    colour = "Drift/Compensation behavior"
+  ) +
+  theme(
+    legend.position = "right",
+    strip.background = element_blank()
+  )
+
+# Toutes les saisons
+ggplot(hourly_segments,
+       aes(x = crosswind,
+           y = perpendicular_speed,
+           colour = comp)) +
+  geom_point(alpha = 0.7, size = 2) +
+  scale_colour_manual(values = comp_colors) +
+  theme_bw() +
+  labs(
+    x = "Crosswind (m/s)",
+    y = "Perpendicular speed (m/s)",
+    colour = "Drift/Compensation behavior"
+  ) +
+  theme(
+    legend.position = "right",
+    strip.background = element_blank()
+  )
+
+
+summary(hourly_segments$uwnd)
+summary(hourly_segments$vwnd)
+```
+
+## Comparaisons tailwind \~ mois
+
+```{r}
+#### Comparaison conditions de vent : sept-oct vs fev-avril ####
+ conflicts_prefer(lme4::lmer)
+
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(ggeffects)
+library(ggsignif)
+library(stringr)
+
+
+## 1. Définition des deux périodes (mois calendaire, indépendant de MIGRATION)
+hourly_segments <- hourly_segments %>%
+  mutate(
+    month = month(hour),
+    period = case_when(
+      month %in% c(9, 10)  ~ "Sept-Oct",
+      month %in% c(2, 3, 4) ~ "Fev-Avril",
+      TRUE ~ NA_character_
+    ),
+    period = factor(period, levels = c("Sept-Oct", "Fev-Avril"))
+  )
+
+hourly_segments <- hourly_segments %>%
+  mutate(
+    bird_ID = str_remove(track_ID, "_(autumn|spring)_\\d{4}$")
+  )
+
+comp_data <- hourly_segments %>%
+  filter(!is.na(period))
+
+str(comp_data)
+
+# Vérif rapide des effectifs
+comp_data %>% count(period, bird_ID) %>% count(period, name = "n_oiseaux")
+comp_data %>% count(period)
+
+## 2. Modèles mixtes (effet aléatoire oiseau, éventuellement track_ID nichée)
+mod_tailwind <- lmer(tailwind ~ period + (1 | bird_ID/track_ID), data = comp_data)
+summary(mod_tailwind)
+
+mod_windspeed <- lmer(wind_speed ~ period + (1 | bird_ID/track_ID), data = comp_data)
+summary(mod_windspeed)
+
+## 3. Prédictions pour visualisation (ggeffects)
+pred_tailwind <- ggpredict(mod_tailwind, terms = "period")
+pred_windspeed <- ggpredict(mod_windspeed, terms = "period")
+
+## 4. Graphiques
+p_tailwind <- ggplot(comp_data, aes(x = period, y = tailwind, fill = period)) +
+  geom_violin(alpha = 0.4, trim = FALSE) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.7) +
+  geom_signif(comparisons = list(c("Sept-Oct", "Fev-Avril")),
+              map_signif_level = TRUE, test = "wilcox.test") +
+  labs(       y = "Tailwind (m/s)", x = NULL) +
+  theme_minimal()
+
+p_windspeed <- ggplot(comp_data, aes(x = period, y = wind_speed, fill = period)) +
+  geom_violin(alpha = 0.4, trim = FALSE) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.7) +
+  geom_signif(comparisons = list(c("Sept-Oct", "Fev-Avril")),
+              map_signif_level = TRUE, test = "wilcox.test") +
+  labs(       y = "Wind speed (m/s)", x = NULL) +
+  theme_minimal()
+
+p_tailwind
+p_windspeed
+```
+
+Par mois
+
+```{r}
+#### Comparaison mois par mois : Sept vs Oct, et Fev vs Avril ####
+conflicts_prefer(ggplot2::annotate)
+conflicts_prefer(lmerTest::lme4)
+
+library(tidyverse)
+library(lmerTest)
+
+hourly_segments <- hourly_segments %>%
+  mutate(
+    month = month(hour),
+    month_name = case_when(
+      month == 9  ~ "Septembre",
+      month == 10 ~ "Octobre",
+      month == 2  ~ "Fevrier",
+      month == 4  ~ "Avril",
+      TRUE ~ NA_character_
+    )
+  )
+
+#### Fonction utilitaire pour extraire la p-value du coefficient du facteur ####
+get_p_label <- function(model) {
+  coefs <- summary(model)$coefficients
+  p_val <- coefs[2, "Pr(>|t|)"]
+  if (is.na(p_val)) return("p = NA")
+  if (p_val < 0.001) return("p < 0.001")
+  paste0("p = ", formatC(p_val, format = "f", digits = 3))
+}
+
+## --- 1. Comparaison Septembre vs Octobre ---
+comp_autumn <- hourly_segments %>%
+  filter(month_name %in% c("Septembre", "Octobre")) %>%
+  mutate(month_name = factor(month_name, levels = c("Septembre", "Octobre")))
+
+mod_tailwind_aut <- lmerTest::lmer(
+  tailwind ~ month_name + (1 | bird_ID/track_ID),
+  data = comp_autumn
+)
+summary(mod_tailwind_aut)
+lab_tail_aut <- get_p_label(mod_tailwind_aut)
+
+mod_windspeed_aut <- lmerTest::lmer(
+  wind_speed ~ month_name + (1 | bird_ID/track_ID),
+  data = comp_autumn
+)
+summary(mod_windspeed_aut)
+lab_wind_aut <- get_p_label(mod_windspeed_aut)
+
+## --- 2. Comparaison Fevrier vs Avril ---
+comp_spring <- hourly_segments %>%
+  filter(month_name %in% c("Fevrier", "Avril")) %>%
+  mutate(month_name = factor(month_name, levels = c("Fevrier", "Avril")))
+
+mod_tailwind_spr <- lmerTest::lmer(
+  tailwind ~ month_name + (1 | bird_ID/track_ID),
+  data = comp_spring
+)
+summary(mod_tailwind_spr)
+lab_tail_spr <- get_p_label(mod_tailwind_spr)
+
+mod_windspeed_spr <- lmerTest::lmer(
+  wind_speed ~ month_name + (1 | bird_ID/track_ID),
+  data = comp_spring
+)
+summary(mod_windspeed_spr)
+lab_wind_spr <- get_p_label(mod_windspeed_spr)
+
+
+## --- 3. Graphiques ---
+
+plot_comp <- function(data, var, ylab, title = NULL, p_label = NULL, p_offset = 1.05) {
+  y_pos <- max(data[[var]], na.rm = TRUE) * 1.05
+  ggplot(data, aes(x = month_name, y = .data[[var]], fill = month_name)) +
+    geom_violin(alpha = 0.4, trim = FALSE) +
+    geom_boxplot(width = 0.15, outlier.shape = NA, alpha = 0.7) +
+    annotate(
+      "segment",
+      x = 1,
+      xend = 2,
+      y = y_pos,
+      yend = y_pos
+    ) +
+    annotate(
+      "text",
+      x = 1.5,
+      y = y_pos * p_offset,
+      label = p_label
+    ) +
+    labs(
+      title = title,
+      y = ylab,
+      x = NULL
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      axis.title = element_text(size = 14),
+      axis.text.x = element_text(size = 12)
+    )
+}
+
+p_tailwind_aut <- plot_comp(
+  comp_autumn,
+  "tailwind",
+  "Tailwind (m/s)",
+  title = "a",
+  p_label = lab_tail_aut,
+  p_offset = 1.15
+)
+p_windspeed_aut <- plot_comp(
+  comp_autumn,
+  "wind_speed",
+  "Wind speed (m/s)",
+  title = "b",
+  p_label = lab_wind_aut
+)
+p_tailwind_spr <- plot_comp(
+  comp_spring,
+  "tailwind",
+  "Tailwind (m/s)",
+  title = "c",
+  p_label = lab_tail_spr,
+  p_offset = 1.15
+)
+p_windspeed_spr <- plot_comp(
+  comp_spring,
+  "wind_speed",
+  "Wind speed (m/s)",
+  title = "d",
+  p_label = lab_wind_spr
+)
+
+p_tailwind_aut
+p_windspeed_aut
+p_tailwind_spr
+p_windspeed_spr
+
+## Affichage groupé
+library(patchwork)
+(p_tailwind_aut + p_windspeed_aut) / (p_tailwind_spr + p_windspeed_spr)
+
+ggsave("C:/Users/alrodrigues/Documents/M2 AMU/STAGE M2/Figures/ANNEXES/speed_by_season.png",
+       width = 10, height = 6, dpi = 300)
+```
+
+```{R}
+#### Extraction des coefficients des 4 modèles ####
+extract_coef <- function(model, comparison, variable) {
+  coefs <- summary(model)$coefficients
+  data.frame(
+    Comparaison = comparison,
+    Variable = variable,
+    Estimate = round(coefs[2, "Estimate"], 3),
+    SE = round(coefs[2, "Std. Error"], 3),
+    t_value = round(coefs[2, "t value"], 3),
+    p_value = coefs[2, "Pr(>|t|)"],
+    p_label = get_p_label(model)
+  )
+}
+
+coef_table <- rbind(
+  extract_coef(mod_tailwind_aut, "Septembre vs Octobre", "Tailwind"),
+  extract_coef(mod_windspeed_aut, "Septembre vs Octobre", "Wind speed"),
+  extract_coef(mod_tailwind_spr, "Fevrier vs Avril", "Tailwind"),
+  extract_coef(mod_windspeed_spr, "Fevrier vs Avril", "Wind speed")
+)
+
+print(coef_table)
+
+
+
+# N
+
+#### Extraction du N (observations + nombre d'oiseaux) pour chaque modèle ####
+get_n_info <- function(model, data) {
+  n_obs <- nobs(model)
+  n_birds <- length(unique(data$bird_ID))
+  n_tracks <- length(unique(data$track_ID))
+  data.frame(
+    n_obs = n_obs,
+    n_birds = n_birds,
+    n_tracks = n_tracks
+  )
+}
+
+n_table <- rbind(
+  cbind(Comparaison = "Septembre vs Octobre", Variable = "Tailwind",
+        get_n_info(mod_tailwind_aut, comp_autumn)),
+  cbind(Comparaison = "Septembre vs Octobre", Variable = "Wind speed",
+        get_n_info(mod_windspeed_aut, comp_autumn)),
+  cbind(Comparaison = "Fevrier vs Avril", Variable = "Tailwind",
+        get_n_info(mod_tailwind_spr, comp_spring)),
+  cbind(Comparaison = "Fevrier vs Avril", Variable = "Wind speed",
+        get_n_info(mod_windspeed_spr, comp_spring))
+)
+
+print(n_table)
+```
+
+# ANNEXE
+
+## Code Vansteelant, 2021:
+
+## Adaptive drift and barrier-avoidance by a fly-forage migrant along a climate-driven flyway
+
+GitHub - Wouter-Vansteelant/Vansteelant-etal-2021-Movement-Ecology: Code for reproducing analyses of Vansteelant et al. (2021) Movement Ecology · GitHub
+
+## p3d_MappingPerformance-daily_FigS3.Rp
+
+```{r}
+#| eval: false
+#| include: false
+### Read packages 
+ipak <- function(pkg){
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+  if (length(new.pkg)) 
+    install.packages(new.pkg, dependencies = TRUE)
+  sapply(pkg, require, character.only = TRUE)
+}
+
+# usage
+packages <- c("RNCEP","rsq")
+ipak(packages)
+
+# read all wind data previously extracted by RNCEP
+winds <- read.csv('./Figures 2021/EF_migration_traveldays_winddata-v20210105.csv')
+winds <- winds[,!(colnames(winds) %in% c("X","travel"))]
+winds$dt <- as.POSIXct(strptime(winds$dt, format="%Y-%m-%d %H:%M:%S"), tz='UTC')
+
+# merge movement and wind data
+data <- subset(data,data$travel >= 1)
+data$yrtrip <- paste(data$trip,data$yr,sep='_')
+# Nous yrtrip c'est 
+
+data <- merge(data,winds,all.x=T)
+
+################################################################################
+####        DETERMINE INTENDED TRAVEL DIRECTION AT EACH LOC             ########
+################################################################################
+# determine closest point in Madagascar
+# create df for country polygons
+#countries <- shapefile("./Maps/ne_50m_admin_0_countries/ne_50m_admin_0_countries.shp")
+#countries <- countries[countries$continent %in% c("Europe","Africa","Asia"),]
+madagascar <- countries[countries$admin == "Madagascar",]
+
+# for return trips use center point of Alegranza as destination
+data$dest.long <- ifelse(data$trip == "return",ale.long,as.numeric(dist2Line(cbind(data$long,data$lat), madagascar, distfun=distGeo)[,2]))
+data$dest.lat <- ifelse(data$trip == "return",ale.lat,as.numeric(dist2Line(cbind(data$long,data$lat), madagascar, distfun=distGeo)[,3]))
+rm(madagascar)
+
+#calculate intended travel direction as direction to 
+# Madagacar (for outbound) and Alegranza (for inbound)
+data$itd <- earth.bear(long1=data$long, lat1=data$lat, long2=data$dest.long, lat2=data$dest.lat)
+data$itd <- ifelse(data$itd > 180, data$itd-360, data$itd)
+
+# calculate loxodrome distance to goal
+#data$dtg <- deg.dist(lat1=data$lat,long1=data$long,lat2=data$dest.lat,long2=data$dest.long)
+
+#######              RECALCULATE WIND                 #############
+###################################################################
+### DETERMINE ANGLE WIND RELATIVE TO EARTH NORTH FROM U AND V COMPONENTS ### 
+data$w <- (data$u^2 + data$v^2)^(1/2)			# determine strength of wind in m/s #
+data$alfa <- atan2(data$u/data$w,data$v/data$w)*(180/pi)
+data$c_alfa <- circular(data$alfa, units = 'degrees', template ='geographics')
+
+###   CALCULATE SIDEWARD AND FORWARD SPEED OF BIRD AND WIND RELATIVE TO ITD
+################################################################################
+
+### determine incident angle of wind, heading and flight direction with itd
+data$beta <- data$alfa - data$itd
+data$beta <- ifelse(data$beta > 180,data$beta - 360,ifelse(data$beta < -180,data$beta + 360,data$beta))
+
+data$teta <- data$dir - data$itd
+data$teta <- ifelse(data$teta > 180,data$teta - 360,ifelse(data$teta < -180,data$teta + 360,data$teta))
+
+## determine forward and sideword movement, active movement and wind movement
+data$spd <- data$spd 
+data$spd.sw <- data$spd * sin(rad(data$teta))
+data$spd.fw <- data$spd * cos(rad(data$teta))
+
+data$sidewind <- data$w * sin(rad(data$beta))
+data$tailwind <- data$w * cos(rad(data$beta))
+
+# calcualte realized tailwind
+data$gamma <- data$alfa - data$dir
+data$gamma <- ifelse(data$gamma > 180,data$gamma - 360,ifelse(data$gamma < -180,data$gamma + 360,data$gamma))
+data$sidewind.r <- data$w * sin(rad(data$gamma))
+data$tailwind.r <- data$w * cos(rad(data$gamma))
+
+# calculate wind support gain
+data$gain <- data$tailwind.r - data$tailwind
+
+################################################################################
+####        CLASSIFY COMPENSATION BASED ON U COMP MOVE AND WIND         ########
+################################################################################
+
+data$stw <- data$spd.sw/data$sidewind
+data$comp <- rep('0')
+data[which(abs(data$sidewind)*3.6 < 5),]$comp <- 'NSW'
+data[which(abs(data$sidewind)*3.6 < 5 & sign(data$sidewind) == sign(data$spd.sw) & abs(data$spd.sw)*3.6 >= 5),]$comp <- 'DO'
+data[which(abs(data$sidewind)*3.6 < 5 & sign(data$sidewind) != sign(data$spd.sw) & abs(data$spd.sw)*3.6 >= 5),]$comp <- 'CO'
+data[which(abs(data$sidewind)*3.6 >= 5 & abs(data$stw) <= 0.2),]$comp <- 'CF'
+data[which(abs(data$sidewind)*3.6 >= 5 & sign(data$sidewind) == sign(data$spd.sw) & abs(data$stw) > 0.2 & abs(data$stw) < 0.8),]$comp <- 'CP'
+data[which(abs(data$sidewind)*3.6 >= 5 & sign(data$sidewind) != sign(data$spd.sw) & abs(data$stw) > 0.2 & abs(data$stw) < 0.8),]$comp <- 'CO'
+data[which(abs(data$sidewind)*3.6 >= 5 & sign(data$sidewind) == sign(data$spd.sw) & abs(data$stw) >= 0.8 & abs(data$stw) < 1.2),]$comp <- 'DF'
+data[which(abs(data$sidewind)*3.6 >= 5 & sign(data$sidewind) != sign(data$spd.sw) & abs(data$stw) >= 0.8 & abs(data$stw) < 1.2),]$comp <- 'CO'
+data[which(abs(data$sidewind)*3.6 >= 5 & sign(data$sidewind) == sign(data$spd.sw) & abs(data$stw) >= 1.2),]$comp <- 'DO'
+data[which(abs(data$sidewind)*3.6 >= 5 & sign(data$sidewind) != sign(data$spd.sw) & abs(data$spd.sw) >= 1.2),]$comp <- 'CO' 
+```
